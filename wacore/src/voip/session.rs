@@ -19,9 +19,10 @@ use super::rtcp::{
     parse_rtcp_sender_ssrc,
 };
 use super::rtp::{
-    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_MEDIA_FRAME_INFO_DELTA,
+    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_CLOCK_RATE, VIDEO_MEDIA_FRAME_INFO_DELTA,
     VIDEO_MEDIA_FRAME_INFO_IDR, VideoRtpStream, WHATSAPP_RTP_EXTENSION_PROFILE,
-    encode_rtp_header_into, parse_rtp_header, rtp_header_byte_length,
+    encode_rtp_header_into, parse_rtp_header, rtp_header_byte_length, rtp_timestamp_after,
+    video_short_offset, video_short_offset_range,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
 use crate::voip_control::VideoFecConfig;
@@ -372,6 +373,9 @@ pub struct MediaPipeline {
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
+    /// Where our audio's media clock stood on the engine's clock, for Sender Reports: the last
+    /// packet's timestamp, the next one's, and when the audio behind it was handed over.
+    audio_clock_anchor: Option<(u32, u32, u64)>,
 }
 
 pub(crate) struct SendRekey {
@@ -426,6 +430,7 @@ impl MediaPipeline {
             aux_recv_streams: SrtpRecvStreams::default(),
             video_recv_streams: SrtpRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
+            audio_clock_anchor: None,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
                 &format_e2e_srtp_participant_id(p.peer_lid),
@@ -454,13 +459,44 @@ impl MediaPipeline {
 
     /// An SRTCP-protected Sender Report for the audio stream (our send SSRC), or the accumulated
     /// packet/octet totals since the call began. Emitted periodically by the engine.
+    ///
+    /// `wallclock_ms` and `monotonic_ms` are one instant on the two clocks. The report's RTP
+    /// timestamp is our audio's media clock at that instant: a frame's first sample was taken one
+    /// frame before it was handed over, so the next packet's timestamp stands for the hand-over,
+    /// and the clock runs on from there at `clock_rate`.
     pub(crate) fn audio_sender_report(
         &mut self,
-        now_ms: u64,
+        wallclock_ms: u64,
+        monotonic_ms: u64,
+        clock_rate: u32,
         report: Option<&RtcpReceptionReport>,
     ) -> Vec<u8> {
+        let timestamp = self.audio_report_timestamp(monotonic_ms, clock_rate);
         self.srtcp
-            .sender_report(self.rtp.ssrc, self.rtp.rtp_timestamp(), now_ms, report)
+            .sender_report(self.rtp.ssrc, timestamp, wallclock_ms, report)
+    }
+
+    /// Our audio's RTP timestamp at `monotonic_ms`, for [`Self::audio_sender_report`].
+    pub(crate) fn audio_report_timestamp(&self, monotonic_ms: u64, clock_rate: u32) -> u32 {
+        self.audio_clock_anchor
+            .filter(|_| clock_rate > 0)
+            .map_or(self.rtp.rtp_timestamp(), |(_, next, at)| {
+                rtp_timestamp_after(next, monotonic_ms.saturating_sub(at), clock_rate)
+            })
+    }
+
+    /// Note that audio handed to the engine at `now_ms` may have sent a packet; when it did, the
+    /// Sender Reports measure our audio clock from it.
+    pub(crate) fn note_audio_handed_over(&mut self, now_ms: u64) {
+        let Some((sent, next)) = self.rtp.sent_and_next_timestamp() else {
+            return;
+        };
+        if self
+            .audio_clock_anchor
+            .is_none_or(|(anchored, _, _)| anchored != sent)
+        {
+            self.audio_clock_anchor = Some((sent, next, now_ms));
+        }
     }
 
     /// The native client sends this once when the audio RTCP session is associated.
@@ -787,6 +823,15 @@ pub struct VideoPipeline {
     srtcp: SrtcpSender,
     /// Forward error correction for our video, once the call turns it on.
     fec: Option<VideoFecStream>,
+    /// Capture times of the access units sent most recently with one, as (RTP timestamp, capture
+    /// millisecond), newest last; what [`VideoPipeline::stamp_departure`] measures from.
+    /// An access unit protected by FEC is not listed: the repair packets cover each packet's header
+    /// as it was built, so a departure stamp would make the peer rebuild a lost packet with a
+    /// corrupted offset.
+    capture_times: std::collections::VecDeque<(u32, u64)>,
+    /// The newest access unit's RTP timestamp and when its picture was taken on the engine's clock
+    /// (when it was packetized, without a capture time), for Sender Reports.
+    clock_anchor: Option<(u32, u64)>,
 }
 
 /// Our video's FEC stream: an SSRC, sequence numbers and rollover counter of its own, under the
@@ -859,6 +904,10 @@ impl VideoFecStream {
     }
 }
 
+/// Access units whose capture times [`VideoPipeline`] keeps for stamping departures. The pacer
+/// holds a few frames at most, so this outlasts every AU still queued behind it.
+const VIDEO_CAPTURE_TIMES_KEPT: usize = 32;
+
 /// Borrowed inputs for [`VideoPipeline::new`]. No `samples_per_packet`: the
 /// video timestamp advances by a fixed per-AU stride instead.
 #[derive(Clone, Copy)]
@@ -910,6 +959,8 @@ impl VideoPipeline {
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
             fec: None,
+            capture_times: std::collections::VecDeque::new(),
+            clock_anchor: None,
         })
     }
 
@@ -951,13 +1002,29 @@ impl VideoPipeline {
     }
 
     /// An SRTCP-protected Sender Report for the video stream.
+    ///
+    /// `wallclock_ms` and `monotonic_ms` are one instant on the two clocks. Our video's RTP
+    /// timestamps follow capture, so the report maps the wall clock to the media clock from the
+    /// newest picture's capture, not from its departure: pairing the report's send time with a
+    /// capture-stamped timestamp would tell the peer every picture was taken later than it was,
+    /// and it would hold our video behind our audio.
     pub(crate) fn video_sender_report(
         &mut self,
-        now_ms: u64,
+        wallclock_ms: u64,
+        monotonic_ms: u64,
         report: Option<&RtcpReceptionReport>,
     ) -> Vec<u8> {
+        let timestamp = self.report_timestamp(monotonic_ms);
         self.srtcp
-            .sender_report(self.rtp.ssrc, self.rtp.rtp_timestamp(), now_ms, report)
+            .sender_report(self.rtp.ssrc, timestamp, wallclock_ms, report)
+    }
+
+    /// Our video's RTP timestamp at `monotonic_ms`, for [`Self::video_sender_report`].
+    pub(crate) fn report_timestamp(&self, monotonic_ms: u64) -> u32 {
+        self.clock_anchor
+            .map_or(self.rtp.rtp_timestamp(), |(timestamp, at)| {
+                rtp_timestamp_after(timestamp, monotonic_ms.saturating_sub(at), VIDEO_CLOCK_RATE)
+            })
     }
 
     pub fn send_ssrc(&self) -> u32 {
@@ -1102,6 +1169,19 @@ impl VideoPipeline {
     /// [`RTP_PAYLOAD_TYPE_VIDEO_FEC`] on the FEC SSRC, right behind the video packet that closes
     /// their span.
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
+        self.protect_video_captured(au, 0, None)
+    }
+
+    /// [`Self::protect_video`] for a picture captured at `captured_ms`, on the same millisecond
+    /// clock as `now_ms`. Each packet's transmission offset is the time since capture as of now;
+    /// [`Self::stamp_departure`] moves it on to when the packet actually leaves. Without a capture
+    /// time the offset is zero.
+    pub fn protect_video_captured(
+        &mut self,
+        au: &[u8],
+        now_ms: u64,
+        captured_ms: Option<u64>,
+    ) -> Vec<Vec<u8>> {
         if au.len() > H264_MAX_AU_BYTES {
             return Vec::new();
         }
@@ -1114,6 +1194,9 @@ impl VideoPipeline {
         } else {
             VIDEO_MEDIA_FRAME_INFO_DELTA
         };
+        let short_offset = captured_ms.map_or(0, |captured| {
+            video_short_offset(now_ms.saturating_sub(captured))
+        });
         let mut packets = Vec::with_capacity(payloads.len());
         let mut fec = self.fec.as_mut().filter(|fec| fec.sender.enabled());
         if let Some(fec) = fec.as_mut() {
@@ -1121,7 +1204,21 @@ impl VideoPipeline {
         }
         let last = payloads.len().saturating_sub(1);
         for (i, payload) in payloads.iter().enumerate() {
-            let header = self.rtp.next_video_packet(i == last, media_frame_info);
+            let header =
+                self.rtp
+                    .next_video_packet_with_offset(i == last, media_frame_info, short_offset);
+            if i == 0 {
+                self.clock_anchor = Some((header.timestamp, captured_ms.unwrap_or(now_ms)));
+            }
+            if i == 0
+                && fec.is_none()
+                && let Some(captured) = captured_ms
+            {
+                if self.capture_times.len() == VIDEO_CAPTURE_TIMES_KEPT {
+                    self.capture_times.pop_front();
+                }
+                self.capture_times.push_back((header.timestamp, captured));
+            }
             let roc = self.send_roc.advance(header.sequence_number);
             self.srtcp.record(1, payload.len());
             packets.push(protect_srtp_packet(
@@ -1149,6 +1246,55 @@ impl VideoPipeline {
         }
         self.pkt_scratch = payloads;
         packets
+    }
+
+    /// Restamp a packet [`Self::protect_video_captured`] built, as it leaves at `now_ms`: its
+    /// transmission offset becomes the time from its picture's capture to now, and its tag is
+    /// computed again over the new header. The offset sits in the authenticated header, so it
+    /// cannot be stamped any later than this; the pacer may hold a keyframe's last packets for
+    /// longer than a frame interval, which a stamp taken when the access unit was packetized
+    /// would leave out.
+    ///
+    /// Returns `None`, and the packet stays as it is, unless it is one of ours from an access
+    /// unit with a capture time and it still authenticates under the current send key (a key
+    /// replaced since it was built must not be used to sign it).
+    pub fn stamp_departure(&self, now_ms: u64, packet: &[u8]) -> Option<Vec<u8>> {
+        let header = parse_rtp_header(packet)?;
+        if header.ssrc != self.rtp.ssrc || header.video_extension.is_none() {
+            return None;
+        }
+        let &(_, captured) = self
+            .capture_times
+            .iter()
+            .rev()
+            .find(|(timestamp, _)| *timestamp == header.timestamp)?;
+        let range = video_short_offset_range(packet)?;
+        let split = packet.len().checked_sub(self.warp_mi_tag_len)?;
+        if split <= range.end {
+            return None;
+        }
+        let roc = self.send_roc.roc_of(header.sequence_number);
+        let (without_tag, tag) = packet.split_at(split);
+        if !verify_warp_mi_tag(
+            &self.send_keys.auth_key,
+            without_tag,
+            roc,
+            self.warp_mi_tag_len,
+            tag,
+        ) {
+            return None;
+        }
+        let offset = video_short_offset(now_ms.saturating_sub(captured));
+        let mut stamped = Vec::with_capacity(packet.len());
+        stamped.extend_from_slice(without_tag);
+        stamped[range].copy_from_slice(&offset.to_be_bytes());
+        append_warp_mi_tag_in_place(
+            &self.send_keys.auth_key,
+            &mut stamped,
+            roc,
+            self.warp_mi_tag_len,
+        );
+        Some(stamped)
     }
 
     /// Inbound: authenticate+decrypt one RTP packet and feed the depacketizer;
@@ -2028,7 +2174,7 @@ mod tests {
             rx.unprotect_audio(&before).is_none(),
             "an authenticated RTP packet must be delivered only once"
         );
-        let first_rtcp = tx.audio_sender_report(1_000, None);
+        let first_rtcp = tx.audio_sender_report(1_000, 1_000, 16_000, None);
         assert!(rx.unprotect_rtcp(&first_rtcp).is_some());
         let first_index = u32::from_be_bytes(
             first_rtcp
@@ -2058,7 +2204,7 @@ mod tests {
         assert_eq!(rx.unprotect_audio(&after).unwrap().1, payload);
         assert!(old_rx.unprotect_audio(&after).is_none());
 
-        let second_rtcp = tx.audio_sender_report(2_000, None);
+        let second_rtcp = tx.audio_sender_report(2_000, 2_000, 16_000, None);
         assert!(rx.unprotect_rtcp(&second_rtcp).is_some());
         let second_index = u32::from_be_bytes(
             second_rtcp[second_rtcp.len() - SRTCP_AUTH_TAG_LEN - 4
@@ -2174,6 +2320,152 @@ mod tests {
         let mut au = vec![0, 0, 0, 1, 0x65];
         au.extend((0..nal_len).map(|i| (i % 251) as u8));
         au
+    }
+
+    fn short_offsets(packets: &[Vec<u8>]) -> Vec<i16> {
+        packets
+            .iter()
+            .map(|packet| {
+                parse_rtp_header(packet)
+                    .and_then(|header| header.video_extension)
+                    .unwrap()
+                    .short_offset
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captured_video_offsets_measure_to_packetization_then_departure() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+
+        let packets = tx.protect_video_captured(&video_au(4000), 1_018, Some(1_000));
+        assert!(packets.len() > 1);
+        assert!(short_offsets(&packets).iter().all(|&offset| offset == 18));
+
+        // Leaving 40 ms after packetizing: the offset moves on, and the receiver still
+        // authenticates the packet and reads the new value.
+        let stamped = packets
+            .iter()
+            .map(|packet| tx.stamp_departure(1_058, packet).unwrap())
+            .collect::<Vec<_>>();
+        assert!(short_offsets(&stamped).iter().all(|&offset| offset == 58));
+        for (original, stamped) in packets.iter().zip(&stamped) {
+            assert_eq!(original.len(), stamped.len());
+            let header = rx.unprotect_video_packet(stamped).unwrap().0;
+            assert_eq!(header.video_extension.unwrap().short_offset, 58);
+        }
+
+        // Stamping is from the packet as built, so a stamped packet can be stamped again.
+        let again = tx.stamp_departure(1_060, &stamped[0]).unwrap();
+        assert_eq!(short_offsets(&[again])[0], 60);
+        // Clamped to the field's positive range.
+        let late = tx.stamp_departure(1_000 + 40_000, &packets[0]).unwrap();
+        assert_eq!(short_offsets(&[late])[0], i16::MAX);
+    }
+
+    #[test]
+    fn uncaptured_or_foreign_video_is_not_restamped() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut other = VideoPipeline::new(&video_params(&[7u8; 32], a, b)).unwrap();
+
+        let plain = tx.protect_video(&video_au(100));
+        assert_eq!(short_offsets(&plain), [0]);
+        assert_eq!(tx.stamp_departure(5_000, &plain[0]), None);
+
+        // Same SSRC and RTP timestamp as a captured AU of ours, under another key: signing it
+        // with ours would forge it.
+        let ours = tx.protect_video_captured(&video_au(100), 10, Some(0));
+        let _ = other.protect_video(&video_au(100));
+        let foreign = other.protect_video(&video_au(100));
+        let stream = |packet: &[u8]| parse_rtp_header(packet).map(|h| (h.ssrc, h.timestamp));
+        assert_eq!(stream(&foreign[0]), stream(&ours[0]));
+        assert!(tx.stamp_departure(20, &ours[0]).is_some());
+        assert_eq!(tx.stamp_departure(20, &foreign[0]), None);
+        assert_eq!(tx.stamp_departure(20, &[0u8; 8]), None);
+    }
+
+    // The repair packets cover each packet's header as it was built, so a packet under FEC keeps
+    // its packetization offset: a departure stamp would rebuild a lost packet with a wrong one.
+    #[test]
+    fn video_under_fec_keeps_its_packetization_offset() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        tx.configure_fec(0x0bad_f00d, VideoFecConfig::default());
+        let packets = tx.protect_video_captured(&video_au(4000), 1_018, Some(1_000));
+        let media: Vec<_> = packets
+            .iter()
+            .filter(|packet| parse_rtp_header(packet).is_some_and(|h| h.ssrc == tx.send_ssrc()))
+            .cloned()
+            .collect();
+        assert!(media.len() > 1);
+        assert!(short_offsets(&media).iter().all(|&offset| offset == 18));
+        assert!(
+            media
+                .iter()
+                .all(|packet| tx.stamp_departure(1_058, packet).is_none())
+        );
+    }
+
+    // A video Sender Report maps the wall clock to the media clock from the newest picture's
+    // capture: 100 ms after a picture taken at 1 000 ms, the clock is 9 000 ticks past its
+    // timestamp, however late the picture was packetized.
+    #[test]
+    fn video_report_timestamp_runs_from_capture() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        assert!(tx.set_video_timestamp(90_000));
+        tx.protect_video_captured(&video_au(100), 1_060, Some(1_000));
+        assert_eq!(tx.report_timestamp(1_100), 90_000 + 9_000);
+        // Without a capture time, from when the picture was packetized.
+        assert!(tx.set_video_timestamp(180_000));
+        tx.protect_video_captured(&video_au(100), 2_000, None);
+        assert_eq!(tx.report_timestamp(2_010), 180_000 + 900);
+        // Across the timestamp's wrap.
+        let mut wrapping = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        assert!(wrapping.set_video_timestamp(u32::MAX - 99));
+        wrapping.protect_video_captured(&video_au(100), 3_000, Some(2_999));
+        assert_eq!(wrapping.report_timestamp(3_001), 80);
+    }
+
+    // An audio frame's first sample was taken one frame before it was handed over, so the next
+    // packet's timestamp stands for the hand-over and the report's clock runs on from it.
+    #[test]
+    fn audio_report_timestamp_runs_from_the_hand_over() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let lid = "222222222222222:0@lid";
+        let mut tx = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: lid,
+            peer_lid: lid,
+            ssrc: 0x12345678,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        // Nothing sent yet: the stream's own timestamp, as before.
+        tx.note_audio_handed_over(500);
+        assert_eq!(tx.audio_report_timestamp(1_000, 16_000), 0);
+        let _ = tx.protect_audio(&[0x48, 1, 2, 3]);
+        tx.note_audio_handed_over(1_000);
+        assert_eq!(tx.audio_report_timestamp(1_000, 16_000), 960);
+        assert_eq!(tx.audio_report_timestamp(1_030, 16_000), 960 + 480);
+        // A hand-over that sent nothing moves no anchor.
+        tx.note_audio_handed_over(1_020);
+        assert_eq!(tx.audio_report_timestamp(1_030, 16_000), 960 + 480);
+        let _ = tx.protect_audio(&[0x48, 1, 2, 3]);
+        tx.note_audio_handed_over(1_060);
+        assert_eq!(tx.audio_report_timestamp(1_060, 16_000), 1_920);
     }
 
     #[test]

@@ -3488,6 +3488,7 @@ impl TimedVideoFeed {
                         .data(frame.data)
                         .timestamp(frame.timestamp)
                         .generation(self.generation)
+                        .maybe_captured_at(frame.captured_at)
                         .build(),
                 )
                 .fuse();
@@ -13225,11 +13226,13 @@ mod tests {
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetTimestampStride(6000)
         );
+        let captured_at = wacore::time::Instant::now();
         src_tx
             .send(
                 TimedVideoFrame::builder()
                     .data(vec![1, 2, 3])
                     .timestamp(12_000)
+                    .captured_at(captured_at)
                     .build(),
             )
             .await
@@ -13238,6 +13241,7 @@ mod tests {
         assert_eq!(forwarded.data, vec![1, 2, 3]);
         assert_eq!(forwarded.timestamp, 12_000);
         assert_eq!(forwarded.generation, 1);
+        assert_eq!(forwarded.captured_at, Some(captured_at));
     }
 
     #[tokio::test]

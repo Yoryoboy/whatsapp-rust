@@ -2352,17 +2352,47 @@ impl CallEngine {
         match input {
             Input::Timeout => self.on_timeout(now),
             Input::RelayPacket(pkt) => self.on_packet(now, pkt),
-            Input::MicFrame(pcm) => self.on_mic(pcm),
-            Input::EncodedAudio(payload) => self.on_encoded_audio(payload),
-            Input::VideoFrame(au) => self.on_video(au),
+            Input::MicFrame(pcm) => {
+                self.on_mic(pcm);
+                self.note_audio_handed_over(now);
+            }
+            Input::EncodedAudio(payload) => {
+                self.on_encoded_audio(payload);
+                self.note_audio_handed_over(now);
+            }
+            Input::VideoFrame(au) => self.on_video(au, now, None),
         }
     }
 
     /// Apply a source-timestamped video access unit without changing the legacy `Input` enum.
-    pub fn handle_video_frame_at(&mut self, _now: Millis, au: &[u8], timestamp: u32) {
+    pub fn handle_video_frame_at(&mut self, now: Millis, au: &[u8], timestamp: u32) {
+        self.handle_captured_video_frame_at(now, au, timestamp, None);
+    }
+
+    /// [`Self::handle_video_frame_at`] for a picture captured at `captured`, on the engine's clock:
+    /// its packets carry the time from capture to transmission (see
+    /// [`Self::stamp_video_departure`]).
+    pub fn handle_captured_video_frame_at(
+        &mut self,
+        now: Millis,
+        au: &[u8],
+        timestamp: u32,
+        captured: Option<Millis>,
+    ) {
         if !self.terminated {
-            self.on_video_at(au, timestamp);
+            self.on_video_at(au, timestamp, now, captured);
         }
+    }
+
+    /// A video packet this engine put out is leaving at `now`: hand back the packet to send in
+    /// its place, its transmission offset measured to now, or the packet itself when it carries
+    /// no capture time (see [`VideoPipeline::stamp_departure`]).
+    pub fn stamp_video_departure(&self, now: Millis, packet: Bytes) -> Bytes {
+        self.media
+            .as_ref()
+            .and_then(|media| media.video.as_ref())
+            .and_then(|video| video.pipe.stamp_departure(now, &packet))
+            .map_or(packet, Bytes::from)
     }
 
     /// Drain one intent. Returns `Output::Timeout(deadline)` once the queue is empty; the shell
@@ -2764,7 +2794,14 @@ impl CallEngine {
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }
 
-    /// Audio and video share one wall-clock sample for lip sync.
+    fn note_audio_handed_over(&mut self, now: Millis) {
+        if let Some(m) = self.media.as_mut() {
+            m.pipe.note_audio_handed_over(now);
+        }
+    }
+
+    /// Audio and video share one wall-clock sample for lip sync, and each maps it to its own media
+    /// clock at that same instant.
     fn emit_sender_reports(&mut self, monotonic_ms: Millis, wallclock_ms: u64) {
         if !self.group_epoch_ready() {
             return;
@@ -2785,23 +2822,33 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return;
         };
+        let audio_clock_rate = m.audio.format.rtp_clock_rate;
         if let Some((audio_reports, video_reports)) = group_reports {
             if audio_reports.is_empty() {
-                let report = m.pipe.audio_sender_report(wallclock_ms, None);
+                let report =
+                    m.pipe
+                        .audio_sender_report(wallclock_ms, monotonic_ms, audio_clock_rate, None);
                 self.outbox.push_back(Output::Transmit(Bytes::from(report)));
             } else {
                 for reception in &audio_reports {
-                    let report = m.pipe.audio_sender_report(wallclock_ms, Some(reception));
+                    let report = m.pipe.audio_sender_report(
+                        wallclock_ms,
+                        monotonic_ms,
+                        audio_clock_rate,
+                        Some(reception),
+                    );
                     self.outbox.push_back(Output::Transmit(Bytes::from(report)));
                 }
             }
             if let Some(v) = m.video.as_mut().filter(|v| v.active && !v.send_gated) {
                 if video_reports.is_empty() {
-                    let report = v.pipe.video_sender_report(wallclock_ms, None);
+                    let report = v.pipe.video_sender_report(wallclock_ms, monotonic_ms, None);
                     self.outbox.push_back(Output::Transmit(Bytes::from(report)));
                 } else {
                     for reception in &video_reports {
-                        let report = v.pipe.video_sender_report(wallclock_ms, Some(reception));
+                        let report =
+                            v.pipe
+                                .video_sender_report(wallclock_ms, monotonic_ms, Some(reception));
                         self.outbox.push_back(Output::Transmit(Bytes::from(report)));
                     }
                 }
@@ -2809,16 +2856,19 @@ impl CallEngine {
             return;
         }
         let audio_report = m.audio_reception.report(monotonic_ms);
-        let audio_sr = m
-            .pipe
-            .audio_sender_report(wallclock_ms, audio_report.as_ref());
+        let audio_sr = m.pipe.audio_sender_report(
+            wallclock_ms,
+            monotonic_ms,
+            audio_clock_rate,
+            audio_report.as_ref(),
+        );
         self.outbox
             .push_back(Output::Transmit(Bytes::from(audio_sr)));
         if let Some(v) = m.video.as_mut().filter(|v| v.active && !v.send_gated) {
             let video_report = v.reception.report(monotonic_ms);
-            let video_sr = v
-                .pipe
-                .video_sender_report(wallclock_ms, video_report.as_ref());
+            let video_sr =
+                v.pipe
+                    .video_sender_report(wallclock_ms, monotonic_ms, video_report.as_ref());
             self.outbox
                 .push_back(Output::Transmit(Bytes::from(video_sr)));
         }
@@ -4179,7 +4229,7 @@ impl CallEngine {
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }
 
-    fn on_video_at(&mut self, au: &[u8], timestamp: u32) {
+    fn on_video_at(&mut self, au: &[u8], timestamp: u32, now: Millis, captured: Option<Millis>) {
         if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
             && video.active
             && !video.send_gated
@@ -4187,10 +4237,10 @@ impl CallEngine {
         {
             return;
         }
-        self.on_video(au);
+        self.on_video(au, now, captured);
     }
 
-    fn on_video(&mut self, au: &[u8]) {
+    fn on_video(&mut self, au: &[u8], now: Millis, captured: Option<Millis>) {
         if !self.group_epoch_ready() {
             // Everything here is discarded, an IDR included -- so a request the
             // application has already answered has to be made again once the
@@ -4249,7 +4299,7 @@ impl CallEngine {
             });
             v.pipe.configure_fec(fec_ssrc, fec);
         }
-        let packets = v.pipe.protect_video(au);
+        let packets = v.pipe.protect_video_captured(au, now, captured);
         if packets.is_empty() {
             return;
         }
@@ -9698,7 +9748,7 @@ mod tests {
         }
         let _ = drain(&mut eng);
 
-        let audio_sr = audio.audio_sender_report(1_700_000_000_000, None);
+        let audio_sr = audio.audio_sender_report(1_700_000_000_000, 0, 16_000, None);
         eng.handle_input(100, Input::RelayPacket(&audio_sr));
         let _ = drain(&mut eng);
         let audio_lsr = {
@@ -9721,7 +9771,7 @@ mod tests {
             audio_report.last_sender_report
         };
 
-        let video_sr = video.video_sender_report(1_700_000_100_000, None);
+        let video_sr = video.video_sender_report(1_700_000_100_000, 0, None);
         eng.handle_input(200, Input::RelayPacket(&video_sr));
         let _ = drain(&mut eng);
         let group = eng.group.as_mut().expect("group engine");

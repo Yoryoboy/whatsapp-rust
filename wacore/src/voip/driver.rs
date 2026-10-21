@@ -1113,6 +1113,13 @@ async fn run_call_with_clock_and_wallclock(
             } else {
                 0
             };
+            // A retransmission keeps the offset it was first sent with: it answers for a packet
+            // the peer has already timed, and its picture is long past capture.
+            let data = if kind == SendBatchKind::Video {
+                eng.stamp_video_departure(now, data)
+            } else {
+                data
+            };
             let t = transport.clone();
             let fut: BoxFuture<'static, anyhow::Result<()>> =
                 Box::pin(async move { t.send(data).await });
@@ -1585,7 +1592,20 @@ async fn run_call_with_clock_and_wallclock(
             timed = timed_video_in_fut => match timed {
                 Ok(frame) => {
                     if frame.generation == video_generation {
-                        eng.handle_video_frame_at(now_ms(), &frame.data, frame.timestamp);
+                        let now = now_ms();
+                        // Onto the drive clock by age: the source's instant and `now_ms` share no
+                        // origin, and in tests the drive clock is not the monotonic one at all.
+                        let captured = frame.captured_at.map(|at| {
+                            now.saturating_sub(
+                                u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            )
+                        });
+                        eng.handle_captured_video_frame_at(
+                            now,
+                            &frame.data,
+                            frame.timestamp,
+                            captured,
+                        );
                     }
                     let now = now_ms();
                     if let Some(at) = eng.poll_timeout()
@@ -3382,6 +3402,7 @@ mod tests {
                 data: our_au.clone(),
                 timestamp: 9000,
                 generation: 7,
+                captured_at: None,
             })
             .unwrap();
         timed_tx
@@ -3389,6 +3410,7 @@ mod tests {
                 data: our_au.clone(),
                 timestamp: 18000,
                 generation: 7,
+                captured_at: None,
             })
             .unwrap();
         for _ in 0..64 {
@@ -3397,6 +3419,7 @@ mod tests {
                     data: our_au.clone(),
                     timestamp: 9000,
                     generation: 6,
+                    captured_at: None,
                 })
                 .unwrap();
         }
@@ -3440,6 +3463,7 @@ mod tests {
                     data: our_au.clone(),
                     timestamp,
                     generation: 7,
+                    captured_at: None,
                 })
                 .unwrap();
         }
@@ -3719,6 +3743,160 @@ mod tests {
             assert_eq!(
                 stats.snapshot().video_fec_bytes_sent,
                 fec.iter().map(|packet| packet.len() as u64).sum::<u64>()
+            );
+        }
+    }
+
+    // A captured keyframe is paced out over hundreds of milliseconds, and each packet carries the
+    // time from capture to its own departure, not to when the frame was packetized; the packets
+    // still authenticate after the restamp. A frame without a capture time keeps a zero offset.
+    #[test]
+    fn paced_video_carries_capture_to_departure_offset() {
+        use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_TS_STRIDE_15FPS, parse_rtp_header};
+        use crate::voip::session::{VideoPipeline, VideoPipelineParams};
+        use crate::voip::ssrc;
+
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let rt = Arc::new(ManualDeadlineRuntime::default());
+        let clock = rt.clock.clone();
+        let transport = Arc::new(RecordingTransport {
+            allocate_answers: Some(relay_tx.clone()),
+            ..RecordingTransport::default()
+        });
+        let cfg = config();
+        // Receives what we send: its peer is us.
+        let mut receiver = VideoPipeline::new(&VideoPipelineParams {
+            call_key: &cfg.call_key,
+            self_lid: &cfg.peer_lid,
+            peer_lid: &cfg.self_lid,
+            ssrc: ssrc::derive_video_participant_ssrc(
+                &cfg.call_id,
+                &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+            ),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: cfg.warp_mi_tag_len,
+        })
+        .unwrap();
+        let make_au = |len: usize| -> Vec<u8> {
+            let mut au = vec![0, 0, 0, 1, 0x65];
+            au.extend((0..len).map(|i| (i % 251) as u8));
+            au
+        };
+
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (_vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (timed_tx, timed_rx) = async_channel::unbounded::<VideoInput>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let (vctl_tx, vctl_rx) = video_control_channel();
+        assert!(vctl_tx.send(VideoControl::DisableKeepLegacy));
+        assert!(vctl_tx.send(VideoControl::SetInputGeneration(1)));
+        assert!(vctl_tx.send(VideoControl::Enable));
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        // Departure stamps apply only to video outside FEC, whose repair packets cover the
+        // headers as built.
+        eng.set_video_fec(crate::voip_control::VideoFecConfig::disabled());
+        let mut drive = Box::pin(run_call_with_clock(
+            rt.clone(),
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            CallChannels {
+                mic: mic_rx,
+                speaker: spk_tx,
+                encoded_audio_in: async_channel::unbounded::<Bytes>().1,
+                encoded_audio_out: async_channel::unbounded::<EncodedAudioFrame>().0,
+                events: ev_tx,
+                rekey: None,
+                video_in: vin_rx,
+                timed_video_in: Some(timed_rx),
+                video_out: vout_tx,
+                video_ctl: vctl_rx,
+                group_ctl: None,
+                media_stats: Arc::new(crate::voip::media_stats::MediaStatsCell::default()),
+            },
+            eng,
+            move || clock.load(Ordering::Relaxed),
+        ));
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        // Video queued before the relay allocates is dropped, so it goes in once the call is up.
+        assert!(drive.as_mut().poll(&mut context).is_pending());
+        // 300 KB at the pacer's floor of 4 Mbit/s, past its 40 ms burst: over half a second from
+        // first packet to last.
+        timed_tx
+            .try_send(VideoInput {
+                data: make_au(300_000),
+                timestamp: 9000,
+                generation: 1,
+                captured_at: Some(Instant::now()),
+            })
+            .unwrap();
+        timed_tx
+            .try_send(VideoInput {
+                data: make_au(3000),
+                timestamp: 18000,
+                generation: 1,
+                captured_at: None,
+            })
+            .unwrap();
+        let video_sent = || {
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| {
+                    parse_rtp_header(p)
+                        .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264 && h.marker)
+                })
+                .count()
+        };
+        for _ in 0..10_000 {
+            assert!(drive.as_mut().poll(&mut context).is_pending());
+            if video_sent() == 2 {
+                break;
+            }
+            let at = *rt
+                .deadlines
+                .lock()
+                .unwrap()
+                .values()
+                .min()
+                .expect("driver armed a deadline");
+            rt.clock.store(at, Ordering::Relaxed);
+        }
+        drop(drive);
+
+        let sent = transport.sent.lock().unwrap();
+        let offsets_at = |timestamp: u32| {
+            sent.iter()
+                .filter_map(|packet| parse_rtp_header(packet))
+                .filter(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264 && h.timestamp == timestamp)
+                .map(|h| h.video_extension.unwrap().short_offset)
+                .collect::<Vec<_>>()
+        };
+        let captured = offsets_at(9000);
+        assert!(captured.len() > 40, "the keyframe spans many packets");
+        assert!(
+            captured.windows(2).all(|pair| pair[0] <= pair[1]),
+            "offsets only grow as the frame leaves: {captured:?}"
+        );
+        let (first, last) = (captured[0], captured[captured.len() - 1]);
+        assert!(first < 50, "the first packet leaves at once: {first}");
+        assert!(
+            last - first >= 300,
+            "the pacer's hold is part of the offset: {first}..{last}"
+        );
+        let uncaptured = offsets_at(18000);
+        assert!(!uncaptured.is_empty());
+        assert!(uncaptured.iter().all(|&offset| offset == 0));
+
+        for packet in sent.iter().filter(|packet| {
+            parse_rtp_header(packet).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+        }) {
+            assert!(
+                receiver.unprotect_without_picture(packet).is_ok(),
+                "a restamped packet must still authenticate"
             );
         }
     }

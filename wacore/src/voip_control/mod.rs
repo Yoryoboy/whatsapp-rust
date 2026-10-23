@@ -182,8 +182,16 @@ pub enum MediaKeyframeUrgency {
 ///
 /// A group is `clean_group` video packets while the peer's RTCP reports at most
 /// `loss_threshold` of our video lost, and `lossy_group` once it reports more. Both are clamped
-/// to 2..=8 packets: at least two, so FEC never exceeds half the video packets, and at most eight,
-/// so a group ends near a frame boundary without growing past one 15-packet mask.
+/// to 2..=8 packets: at least two, so FEC never exceeds half the video packets, and at most eight.
+///
+/// Groups are interleaved, `clean_interleave` or `lossy_interleave` deep: a span of `depth`
+/// times the group size consecutive packets is dealt round-robin to `depth` groups, so packet `k`
+/// of the span goes to group `k % depth`, and the span's `depth` repair packets follow its last
+/// packet. A burst of up to `depth` consecutive losses then costs each group at most one packet,
+/// which its repair packet rebuilds, where a group of consecutive packets could rebuild only one.
+/// The ratio of repair to video stays one per group size. A depth of 1 is a group of consecutive
+/// packets. Depths are clamped to 1..=8, and a span to what keeps every group's mask two bytes
+/// long (16 packets at depth 2, 15 at depth 3), so a large group at a large depth shrinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct VideoFecConfig {
@@ -199,6 +207,12 @@ pub struct VideoFecConfig {
     /// The RTCP fraction lost (in 256ths) above which `lossy_group` applies. 5 is about 2%.
     #[builder(default = 5)]
     pub loss_threshold: u8,
+    /// Groups interleaved in one span on a clean path. 1 sends groups of consecutive packets.
+    #[builder(default = 2)]
+    pub clean_interleave: u8,
+    /// Groups interleaved in one span while the peer reports loss above `loss_threshold`.
+    #[builder(default = 3)]
+    pub lossy_interleave: u8,
 }
 
 impl Default for VideoFecConfig {

@@ -812,9 +812,10 @@ impl VideoFecStream {
         }
     }
 
-    /// One repair packet, protected, for the group `last` (a video packet's header) closed.
+    /// One repair packet, protected, for a group of the span `last` (a video packet's header)
+    /// closed.
     ///
-    /// It carries the last protected packet's RTP timestamp and always the marker, as WhatsApp's
+    /// It carries the RTP timestamp of the span's last packet, the one it follows, and always the marker, as WhatsApp's
     /// clients send theirs, and the same header extension as that packet minus its frame
     /// information, which describes a picture and this packet is not one.
     fn protect(
@@ -1098,8 +1099,8 @@ impl VideoPipeline {
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
     ///
     /// With FEC configured the result also holds repair packets, payload type
-    /// [`RTP_PAYLOAD_TYPE_VIDEO_FEC`] on the FEC SSRC, each right behind the video packet that
-    /// closes its group.
+    /// [`RTP_PAYLOAD_TYPE_VIDEO_FEC`] on the FEC SSRC, right behind the video packet that closes
+    /// their span.
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
         if au.len() > H264_MAX_AU_BYTES {
             return Vec::new();
@@ -1130,13 +1131,13 @@ impl VideoPipeline {
                 self.warp_mi_tag_len,
                 payload,
             ));
-            // The repair packet goes right behind the packet that closes its group, so it reaches
-            // the peer while the picture it can repair is still being assembled.
+            // The repair packets go right behind the packet that closes their span, so they reach
+            // the peer while the picture they can repair is still being assembled.
             if let Some(fec) = fec.as_mut() {
                 fec.plain.clear();
                 encode_rtp_header_into(&header, &mut fec.plain);
                 fec.plain.extend_from_slice(payload);
-                if let Some(repair) = fec.sender.push(&fec.plain) {
+                for repair in fec.sender.push(&fec.plain) {
                     packets.push(fec.protect(
                         &self.send_keys,
                         self.warp_mi_tag_len,
@@ -1876,22 +1877,30 @@ mod tests {
                 plaintexts.push(plain);
             }
         }
-        assert_eq!(repairs.len(), plaintexts.len() / 8);
-        assert!(repairs.len() >= 2);
-        let mut next = 0usize;
+        // A picture too large for one span of sixteen: whole spans, two interleaved groups each,
+        // and the rest carried over to the next picture.
+        let spans = plaintexts.len() / 16;
+        assert!(spans >= 1 && plaintexts.len() % 16 != 0);
+        assert_eq!(repairs.len(), 2 * spans);
+        let mut protected = std::collections::HashSet::new();
         for (index, repair) in repairs.iter().enumerate() {
             let (header, _) = FecHeader::parse(repair).unwrap();
             assert_eq!(header.protected_ssrc, tx.send_ssrc());
-            let group: Vec<&Vec<u8>> = plaintexts[next..]
+            let members: Vec<u16> = header.protected().collect();
+            assert!(
+                members
+                    .windows(2)
+                    .all(|pair| pair[1].wrapping_sub(pair[0]) == 2),
+                "an interleaved group's members are two apart"
+            );
+            let group: Vec<&Vec<u8>> = plaintexts
                 .iter()
-                .take_while(|p| {
-                    header
-                        .protected()
-                        .any(|seq| seq == parse_rtp_header(p).unwrap().sequence_number)
-                })
+                .filter(|p| members.contains(&parse_rtp_header(p).unwrap().sequence_number))
                 .collect();
-            assert_eq!(group.len(), header.protected().count());
-            next += group.len();
+            assert_eq!(group.len(), members.len());
+            for sequence in &members {
+                assert!(protected.insert(*sequence), "{sequence} protected twice");
+            }
             // Lose a different packet of each group.
             let lost = index % group.len();
             let received: Vec<&[u8]> = group
@@ -1907,9 +1916,9 @@ mod tests {
             );
         }
         assert_eq!(
-            next,
-            plaintexts.len(),
-            "every video packet is protected once"
+            protected.len(),
+            16 * spans,
+            "every video packet of a closed span is protected once"
         );
     }
 

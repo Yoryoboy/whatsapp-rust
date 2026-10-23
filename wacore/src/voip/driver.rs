@@ -3504,6 +3504,7 @@ mod tests {
         );
         eng.set_video_fec(crate::voip_control::VideoFecConfig {
             clean_group: 2,
+            clean_interleave: 1,
             ..crate::voip_control::VideoFecConfig::default()
         });
         let (relay_tx, relay_rx) = async_channel::unbounded();
@@ -3957,8 +3958,8 @@ mod tests {
             video[1].1, video[FRAGMENTS].1,
             "retransmit the original protected fragment"
         );
-        // The video's FEC is paced with it, each packet right behind the group it repairs: four
-        // for 32 fragments at the default one per eight.
+        // The video's FEC is paced with it, right behind the span it repairs: four for 32
+        // fragments at the default one per eight, two behind each span of sixteen.
         let paced: Vec<_> = transport
             .sent
             .lock()
@@ -3974,7 +3975,7 @@ mod tests {
             .collect();
         assert_eq!(paced.len(), FRAGMENTS + 1 + 4);
         for group in 0..4 {
-            let fec = parse_rtp_header(&paced[9 * group + 8].1).unwrap();
+            let fec = parse_rtp_header(&paced[18 * (group / 2) + 16 + group % 2].1).unwrap();
             assert_eq!(fec.payload_type, RTP_PAYLOAD_TYPE_VIDEO_FEC);
             assert_eq!(fec.sequence_number, group as u16 + 1);
         }

@@ -11353,7 +11353,9 @@ mod tests {
         assert_eq!(eng.video_fec_group_size(), Some(4));
         eng.handle_input(3, Input::VideoFrame(&video_delta_au(20_000)));
         let (video, fec) = split(&drain(&mut eng).0);
-        assert_eq!(fec.len(), video.len() / 4);
+        // Whole spans of twelve in three groups; the carried rest of the keyframe's span was two
+        // groups deep and is retired.
+        assert_eq!(fec.len(), 3 * (video.len() / 12));
         eng.handle_input(4, Input::RelayPacket(&report(0, 2)));
         let _ = drain(&mut eng);
         assert_eq!(eng.video_fec_group_size(), Some(8));

@@ -29,6 +29,9 @@ use crate::client::Client;
 /// Mirrors `WAWebOfflineHandler.v = 200`.
 const BATCH_SIZE: u32 = 200;
 
+// Two pulled batches must fit one chat's lane; see `CHAT_QUEUE_ITEMS`.
+const _: () = assert!(crate::inbound_queue::CHAT_QUEUE_ITEMS >= 2 * BATCH_SIZE as usize);
+
 /// Mirrors `WAWebOfflineHandler.S = 100`.
 const REQUEST_DEBOUNCE: Duration = Duration::from_millis(100);
 

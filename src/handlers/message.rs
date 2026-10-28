@@ -395,24 +395,28 @@ mod tests {
             )),
         );
         let mut accepted = 0;
-        for id in 0..128 {
+        let items = crate::inbound_queue::CHAT_QUEUE_ITEMS;
+        for id in 0..2 * items {
             let node = node_to_owned_ref(
                 &NodeBuilder::new("message")
                     .attr("from", "120363000000042@g.us")
                     .attr("id", id.to_string())
-                    .bytes(vec![id as u8; 64 * 1024])
+                    .bytes(vec![id as u8; 16 * 1024])
                     .build(),
             );
             if lane.try_enqueue(node).is_ok() {
                 accepted += 1;
             }
         }
-        assert_eq!(lane.queue_tx.capacity(), Some(64));
-        assert_eq!(accepted, 64);
-        assert_eq!(lane.queue_tx.len(), 64);
+        assert_eq!(lane.queue_tx.capacity(), Some(items));
+        assert_eq!(accepted, items);
+        assert_eq!(lane.queue_tx.len(), items);
         let retained = 32 * 1024 * 1024 - client.inbound_queues().chat.available();
-        assert!((4 * 1024 * 1024..5 * 1024 * 1024).contains(&retained));
-        eprintln!("production lane: {accepted}/128 accepted, {retained} charged bytes");
+        assert!((items * 16 * 1024..crate::inbound_queue::CHAT_BYTES).contains(&retained));
+        eprintln!(
+            "production lane: {accepted}/{} accepted, {retained} charged bytes",
+            2 * items
+        );
         lane.queue_tx.close();
         drop(blocked);
     }

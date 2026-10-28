@@ -87,7 +87,13 @@ impl<T> Drop for DrainingReceiver<T> {
     }
 }
 
-pub(crate) const CHAT_QUEUE_ITEMS: usize = 64;
+// Offline delivery is pulled in batches of `offline_resume::BATCH_SIZE`, and
+// the next batch is requested when the first stanza of the previous one
+// arrives, so up to two batches can be in flight, all from one busy chat.
+// A lane smaller than that overflows on every resume: the burst is refused,
+// the connection recycles, the server redelivers the same backlog, and the
+// resume never gets past it. Memory stays bounded by the byte budgets below.
+pub(crate) const CHAT_QUEUE_ITEMS: usize = 512;
 pub(crate) const CHAT_BYTES: usize = 16 * 1024 * 1024;
 const GLOBAL_CHAT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const ACK_QUEUE_ITEMS: usize = 256;

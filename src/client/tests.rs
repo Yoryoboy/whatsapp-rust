@@ -9620,3 +9620,64 @@ async fn interceptor_claimed_offline_messages_finish_when_claimed() {
         "only the third request is still owed"
     );
 }
+
+/// Greptile's review of whatsapp-rust#1814: a request released after a long
+/// block starts a fresh inactivity window.
+///
+/// Without it, a release landing just before a watchdog tick lets the next
+/// tick find an unchanged activity counter, complete the resume, and from then
+/// on every continuation is suppressed — the third batch would never be
+/// answered.
+#[tokio::test(start_paused = true)]
+async fn a_released_request_restarts_the_watchdog_window() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let chat: Jid = "120363000000000051@g.us".parse().unwrap();
+    let (lane, queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+    for id in 0..200 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    for id in 200..400 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(offline_batch_requests(&recorder), vec![200, 200]);
+
+    // Two watchdog windows pass with the lane still blocked, then the lane
+    // drains just before the third one fires.
+    tokio::time::sleep(Duration::from_secs(179)).await;
+    while let Ok(message) = queued.try_recv() {
+        drop(message);
+    }
+    crate::test_utils::poll_until("the released third batch request", || {
+        offline_batch_requests(&recorder).len() == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "a tick right after the release must not complete a resume whose batch just left"
+    );
+    assert_eq!(
+        client.offline_batch.outstanding(),
+        200,
+        "and the response it is waiting for is still owed"
+    );
+}

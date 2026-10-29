@@ -626,6 +626,10 @@ fn continuation_allowed(client: &Client, generation: u64) -> bool {
 
 async fn send_continuation(client: &Client, generation: u64) {
     let _ = send_batch(client, BATCH_SIZE).await;
+    // A request that just left starts a fresh inactivity window: without this
+    // a release landing just before a tick lets the watchdog complete the
+    // resume before the batch it asked for can be answered.
+    client.offline_batch.note_stanza_activity();
     // Re-check generation after the await: a disconnect+reconnect+rearm
     // during the send would leave the coordinator owned by a newer
     // cycle, and republishing here would overwrite that cycle's CAS

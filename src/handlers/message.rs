@@ -61,7 +61,7 @@ impl MessageHandler {
         // cancelled, refused, or dropped with a retired queue. Taken before the
         // first check so a cancellation still settles the arrival that booked
         // it, instead of leaving the request permanently outstanding.
-        let offline = client.offline_batch.admit(&client, generation, &node);
+        let offline = client.offline_batch.admit(generation, &node);
         if shutdown.is_fired()
             || scope.is_some_and(|scope| !scope.is_current(&client))
             || client
@@ -451,7 +451,7 @@ mod tests {
         );
         let offline = client
             .offline_batch
-            .admit(&client, generation, &node)
+            .admit(generation, &node)
             .expect("an armed resume admits an offline message");
         assert_eq!(client.offline_batch.admitted(), 1);
         let outstanding = client.offline_batch.outstanding();

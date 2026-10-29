@@ -9296,7 +9296,7 @@ async fn offline_admissions_are_settled_by_every_way_a_queued_message_ends() {
     );
     let generation = client.connection_generation.load(Ordering::Acquire);
     let node = offline_message(&chat, 4);
-    let offline = client.offline_batch.admit(&client, generation, &node);
+    let offline = client.offline_batch.admit(generation, &node);
     assert_eq!(client.offline_batch.admitted(), 3);
     match lane
         .enqueue_scoped(

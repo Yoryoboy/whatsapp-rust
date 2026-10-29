@@ -118,8 +118,11 @@ impl OfflineBatchCoordinator {
             .is_ok()
     }
 
-    fn arm(&self, generation: u64, total: usize) {
-        let pacing = Arc::new(Pacing::new(generation, total));
+    /// Arm the resume for `generation` and hand back the channel its parked
+    /// requests are released on, for the one task that sends them.
+    fn arm(&self, generation: u64, total: usize) -> async_channel::Receiver<()> {
+        let (pacing, released) = Pacing::new(generation, total);
+        let pacing = Arc::new(pacing);
         // The first request is booked with the arm: the primer that follows is
         // part of the batch it announces.
         pacing.book_first();
@@ -131,6 +134,7 @@ impl OfflineBatchCoordinator {
         self.stanza_activity.store(0, Ordering::Release);
         self.prev_batch_inflight.store(true, Ordering::Release);
         self.armed.store(true, Ordering::Release);
+        released
     }
 
     fn is_armed_for(&self, generation: u64) -> bool {
@@ -188,17 +192,13 @@ impl OfflineBatchCoordinator {
     /// the queue's layout budget has room for.
     pub(crate) fn admit(
         &self,
-        client: &Arc<Client>,
         generation: u64,
         node: &wacore_binary::OwnedNodeRef,
     ) -> Option<Box<OfflinePendingGuard>> {
         node.get().get_attr("offline")?;
         let pacing = self.current_pacing(generation)?;
         pacing.admit_lane_bound();
-        Some(Box::new(OfflinePendingGuard {
-            client: Arc::clone(client),
-            pacing,
-        }))
+        Some(Box::new(OfflinePendingGuard { pacing }))
     }
 
     #[cfg(test)]
@@ -237,6 +237,12 @@ impl OfflineBatchCoordinator {
 pub(crate) struct Pacing {
     generation: u64,
     state: std::sync::Mutex<PacingState>,
+    /// One message per released request, for the generation's sender task.
+    /// A channel rather than a client handle: whoever settles a finish (a lane
+    /// worker, a queue being torn down) only signals, and a queued message
+    /// carries nothing that ties it to the client, which a lane must not do
+    /// where the client is not `Send`.
+    released: async_channel::Sender<()>,
 }
 
 #[derive(Default)]
@@ -276,14 +282,28 @@ pub(crate) enum SilentDrain {
 }
 
 impl Pacing {
-    fn new(generation: u64, total: usize) -> Self {
-        Self {
+    fn new(generation: u64, total: usize) -> (Self, async_channel::Receiver<()>) {
+        // Unbounded: every release books its own request, so two releases
+        // must never coalesce into one send.
+        let (released, receiver) = async_channel::unbounded();
+        let pacing = Self {
             generation,
             state: std::sync::Mutex::new(PacingState {
                 unbooked: total,
                 ..PacingState::default()
             }),
+            released,
+        };
+        (pacing, receiver)
+    }
+
+    /// Hand a request a finish released to the sender task. A closed channel
+    /// means the generation's task is gone, and so is the request's purpose.
+    fn notify(&self, released: bool) -> bool {
+        if released {
+            let _ = self.released.try_send(());
         }
+        released
     }
 
     /// The one lock every transition takes. A poisoned mutex still holds a
@@ -325,17 +345,23 @@ impl Pacing {
     /// dropped with its queue. `true` means this finish resolved a parked
     /// request, which the caller must send.
     fn finish_admitted(&self) -> bool {
-        let mut state = self.state();
-        state.settle_one();
-        state.admitted = state.admitted.saturating_sub(1);
-        state.release_deferred()
+        let released = {
+            let mut state = self.state();
+            state.settle_one();
+            state.admitted = state.admitted.saturating_sub(1);
+            state.release_deferred()
+        };
+        self.notify(released)
     }
 
     /// One offline stanza that no lane holds is done with.
     fn finish_arrival(&self) -> bool {
-        let mut state = self.state();
-        state.settle_one();
-        state.release_deferred()
+        let released = {
+            let mut state = self.state();
+            state.settle_one();
+            state.release_deferred()
+        };
+        self.notify(released)
     }
 
     /// Decide what a window without a single offline stanza means.
@@ -389,7 +415,6 @@ impl PacingState {
 /// down all settle it by the same path: nothing a lane was handed can keep the
 /// resume waiting after the lane let go of it.
 pub(crate) struct OfflinePendingGuard {
-    client: Arc<Client>,
     /// The generation's pacing object, not a counter: a guard retired by a
     /// reconnect can only ever settle what it was minted with.
     pacing: Arc<Pacing>,
@@ -397,12 +422,9 @@ pub(crate) struct OfflinePendingGuard {
 
 impl Drop for OfflinePendingGuard {
     fn drop(&mut self) {
-        if !self.pacing.finish_admitted() {
-            return;
-        }
-        // The send is its own task: a lane worker finishing a message never
-        // waits on the socket for the request it just released.
-        spawn_deferred_continuation(Arc::clone(&self.client), self.pacing.generation);
+        // A release is sent by the generation's own task: a lane worker
+        // finishing a message never waits on the socket for it.
+        self.pacing.finish_admitted();
     }
 }
 
@@ -419,7 +441,8 @@ pub(crate) fn build_offline_batch_request(count: u32) -> Node {
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.offline_first_batch", level = "debug", skip_all, fields(total = total)))]
 pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
     let generation = client.connection_generation.load(Ordering::Acquire);
-    client.offline_batch.arm(generation, total);
+    let released = client.offline_batch.arm(generation, total);
+    spawn_release_sender(Arc::clone(&client), generation, released);
     log::info!(
         target: "Client/OfflineResume",
         "Resume armed: total={}, requesting first batch of {}",
@@ -523,8 +546,8 @@ pub(crate) fn on_offline_stanza_arrived(client: &Arc<Client>, pending: usize, la
     coord.note_stanza_activity();
     // A stanza no lane will hold is finished as it is handled; a lane-bound one
     // is finished by the guard on its queue entry, so its arrival moves nothing.
-    if !lane_bound && pacing.finish_arrival() {
-        spawn_deferred_continuation(Arc::clone(client), generation);
+    if !lane_bound {
+        pacing.finish_arrival();
     }
     if pending == 0 {
         // Server has nothing more for us; let the end marker drive completion.
@@ -587,11 +610,9 @@ fn schedule_continuation(client: Arc<Client>, generation: u64) {
 /// Finish an offline stanza that was counted as lane-bound on arrival but never
 /// reached the message handler (a stanza interceptor claimed it), so nothing
 /// else will ever settle it.
-pub(crate) fn finish_unqueued(client: &Arc<Client>, generation: u64) {
-    if let Some(pacing) = client.offline_batch.current_pacing(generation)
-        && pacing.finish_arrival()
-    {
-        spawn_deferred_continuation(Arc::clone(client), generation);
+pub(crate) fn finish_unqueued(client: &Client, generation: u64) {
+    if let Some(pacing) = client.offline_batch.current_pacing(generation) {
+        pacing.finish_arrival();
     }
 }
 
@@ -614,20 +635,37 @@ async fn send_continuation(client: &Client, generation: u64) {
     }
 }
 
-/// Send the request a debounce had to defer, once something opened the gate.
-fn spawn_deferred_continuation(client: Arc<Client>, generation: u64) {
+/// The generation's one sender of parked requests: each message on `released`
+/// is a request a finish already booked when it opened the gate. Ends with the
+/// connection, or once the generation's pacing is gone and nothing can release
+/// another.
+fn spawn_release_sender(
+    client: Arc<Client>,
+    generation: u64,
+    released: async_channel::Receiver<()>,
+) {
     let runtime = client.runtime.clone();
+    // Subscribed at the spawn, as the watchdog does, for this connection.
+    let shutdown = client.connection_shutdown_signal();
     runtime
         .spawn(Box::pin(async move {
-            if !continuation_allowed(&client, generation) {
-                return;
+            loop {
+                futures::select! {
+                    message = released.recv().fuse() => if message.is_err() {
+                        return;
+                    },
+                    _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => return,
+                }
+                if !continuation_allowed(&client, generation) {
+                    return;
+                }
+                debug!(
+                    target: "Client/OfflineResume",
+                    "Deferred continuation batch (count={}) once the lane caught up",
+                    BATCH_SIZE,
+                );
+                send_continuation(&client, generation).await;
             }
-            debug!(
-                target: "Client/OfflineResume",
-                "Deferred continuation batch (count={}) once the lane caught up",
-                BATCH_SIZE,
-            );
-            send_continuation(&client, generation).await;
         }))
         .detach();
 }
@@ -768,7 +806,7 @@ mod tests {
         let node = offline_message_node();
         let stale = client
             .offline_batch
-            .admit(&client, 7, &node)
+            .admit(7, &node)
             .expect("armed for generation 7");
         assert_eq!(client.offline_batch.admitted(), 1);
 
@@ -776,7 +814,7 @@ mod tests {
         client.offline_batch.arm(9, 1_000);
         let live = client
             .offline_batch
-            .admit(&client, 9, &node)
+            .admit(9, &node)
             .expect("armed for generation 9");
         let (outstanding, admitted) = (
             client.offline_batch.outstanding(),
@@ -852,7 +890,7 @@ mod tests {
         let total = 1_000;
         let batch = BATCH_SIZE as usize;
         for _ in 0..200 {
-            let pacing = Arc::new(Pacing::new(7, total));
+            let pacing = Arc::new(Pacing::new(7, total).0);
             // Two requests out, and the whole of both in one lane.
             pacing.book_first();
             assert!(matches!(pacing.reserve(), Reservation::Request));
@@ -908,7 +946,7 @@ mod tests {
         let client = armed_client(7, 1_000).await;
         let coord = &client.offline_batch;
         let node = offline_message_node();
-        let guard = coord.admit(&client, 7, &node).expect("armed");
+        let guard = coord.admit(7, &node).expect("armed");
 
         assert!(
             matches!(coord.settle_silent_drain(7), SilentDrain::Backpressure),
@@ -944,7 +982,7 @@ mod tests {
         let batch = BATCH_SIZE as usize;
         let node = offline_message_node();
         let guards: Vec<_> = (0..2 * batch)
-            .map(|_| coord.admit(&client, 7, &node).expect("armed"))
+            .map(|_| coord.admit(7, &node).expect("armed"))
             .collect();
         let pacing = coord.current_pacing(7).expect("armed");
         assert!(matches!(pacing.reserve(), Reservation::Request));

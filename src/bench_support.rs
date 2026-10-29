@@ -1863,8 +1863,12 @@ impl InboundQueueHarness {
             .nodes
             .iter()
             .filter(|node| {
-                lane.try_enqueue_scoped(Arc::clone(node), wacore::runtime::ShutdownSignal::never())
-                    .is_ok()
+                lane.try_enqueue_scoped(
+                    Arc::clone(node),
+                    wacore::runtime::ShutdownSignal::never(),
+                    None,
+                )
+                .is_ok()
             })
             .count();
         assert_eq!(accepted, crate::inbound_queue::CHAT_QUEUE_ITEMS);

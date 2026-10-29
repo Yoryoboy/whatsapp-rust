@@ -13,6 +13,13 @@
 //! "first arrival of the just-sent batch" deterministically elects a single
 //! continuation per cycle, just as WA Web's `$6` timer coalesces
 //! synchronously-arriving stanzas into one `$13` call.
+//!
+//! Additionally paced by processing, which WA Web leaves to the lane: one
+//! cumulative `outstanding` per connection counts the stanzas requested and not
+//! yet finished, and a continuation is only reserved while it fits one batch.
+//! A request is booked when it is decided — never on arrival — so a slow
+//! delivery cannot make the count under-represent what the server still owes,
+//! and two batches is the most one chat lane can be handed.
 
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
@@ -58,6 +65,10 @@ pub(crate) struct OfflineBatchCoordinator {
     /// increment on the receive path and in exchange lets the timeout fire
     /// anywhere in [timeout, 2 * timeout) after the last stanza.
     stanza_activity: AtomicU64,
+    /// Pacing owned by the armed generation. `arm` swaps a fresh object in and
+    /// `reset` takes it out, so a guard or arrival retired by a reconnect can
+    /// only ever reach the object it was minted with.
+    pacing: std::sync::Mutex<Option<Arc<Pacing>>>,
 }
 
 impl OfflineBatchCoordinator {
@@ -66,9 +77,13 @@ impl OfflineBatchCoordinator {
     }
 
     pub fn reset(&self) {
+        // Disarm first: readers stop minting guards before the object they
+        // would count on is gone. Guards already minted keep their own `Arc`
+        // and settle the retired object, where nobody reads them any more.
         self.armed.store(false, Ordering::Release);
         self.generation.store(0, Ordering::Release);
         self.prev_batch_inflight.store(false, Ordering::Release);
+        *self.pacing.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Disarm and report whether this call is the one that did it. The
@@ -103,9 +118,15 @@ impl OfflineBatchCoordinator {
             .is_ok()
     }
 
-    fn arm(&self, generation: u64) {
+    fn arm(&self, generation: u64, total: usize) {
+        let pacing = Arc::new(Pacing::new(generation, total));
+        // The first request is booked with the arm: the primer that follows is
+        // part of the batch it announces.
+        pacing.book_first();
         // Set inner state first; `armed` is published last so readers that
-        // observe armed=true also see the matching generation and inflight.
+        // observe armed=true also see the matching generation, pacing and
+        // inflight.
+        *self.pacing.lock().unwrap_or_else(|p| p.into_inner()) = Some(pacing);
         self.generation.store(generation, Ordering::Release);
         self.stanza_activity.store(0, Ordering::Release);
         self.prev_batch_inflight.store(true, Ordering::Release);
@@ -114,6 +135,30 @@ impl OfflineBatchCoordinator {
 
     fn is_armed_for(&self, generation: u64) -> bool {
         self.armed.load(Ordering::Acquire) && self.generation.load(Ordering::Acquire) == generation
+    }
+
+    /// The pacing of the connection this caller belongs to, or `None` when that
+    /// connection is not the armed one. Handing out the `Arc` is what makes a
+    /// stale caller harmless: it can only reach the generation it was minted
+    /// for.
+    fn current_pacing(&self, generation: u64) -> Option<Arc<Pacing>> {
+        if !self.is_armed_for(generation) {
+            return None;
+        }
+        self.pacing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|pacing| pacing.generation == generation)
+            .cloned()
+    }
+
+    /// What a whole window without an offline stanza means, for the watchdog.
+    pub(crate) fn settle_silent_drain(&self, generation: u64) -> SilentDrain {
+        match self.current_pacing(generation) {
+            Some(pacing) => pacing.settle_silent(),
+            None => SilentDrain::Idle,
+        }
     }
 
     /// Try to claim the "first arrival of just-sent batch" slot. Atomically
@@ -130,6 +175,211 @@ impl OfflineBatchCoordinator {
     fn mark_batch_inflight(&self) {
         self.prev_batch_inflight.store(true, Ordering::Release);
     }
+
+    /// Count one offline stanza the message handler is about to queue in a
+    /// chat lane and return the guard that finishes it. `None` for anything the
+    /// resume does not pace: an unarmed connection, or a live stanza.
+    ///
+    /// Every stanza the message handler receives is bound for a lane (messages,
+    /// status broadcasts and durable group notifications alike), so the tag is
+    /// not checked here; the receive path decides which stanzas come here.
+    ///
+    /// Boxed because it travels in the queued message, where a word is what
+    /// the queue's layout budget has room for.
+    pub(crate) fn admit(
+        &self,
+        client: &Arc<Client>,
+        generation: u64,
+        node: &wacore_binary::OwnedNodeRef,
+    ) -> Option<Box<OfflinePendingGuard>> {
+        node.get().get_attr("offline")?;
+        let pacing = self.current_pacing(generation)?;
+        pacing.admit_lane_bound();
+        Some(Box::new(OfflinePendingGuard {
+            client: Arc::clone(client),
+            pacing,
+        }))
+    }
+}
+
+/// Backlog pacing for one connection generation (S2-S4).
+///
+/// One object per generation, one short `Mutex` and never held across an
+/// `.await`: every decision that must not interleave with another — booking a
+/// request, settling a finish, parking a continuation, releasing one, deciding
+/// what a silent drain means — is a single transition. That is what makes the
+/// cumulative bound exact and the deferred wakeup impossible to lose, in place
+/// of separate counters that could be read and written a window apart.
+pub(crate) struct Pacing {
+    generation: u64,
+    state: std::sync::Mutex<PacingState>,
+}
+
+#[derive(Default)]
+struct PacingState {
+    /// Stanzas this connection asked the server for and has not finished: a
+    /// lane-bound message until its guard drops, any other offline stanza as
+    /// soon as it is handled. Booked when the request is decided, so nothing
+    /// can arrive that the count does not already own.
+    outstanding: usize,
+    /// Preview stanzas no request has booked yet. Booking moves one batch from
+    /// here to `outstanding`, so no request asks for more than was announced.
+    unbooked: usize,
+    /// Lane-bound offline messages still unfinished: our own backpressure, as
+    /// opposed to the server's silence.
+    admitted: usize,
+    /// A continuation the gate had to park, owed to the finish that brings
+    /// `outstanding` back to one batch.
+    deferred: bool,
+}
+
+/// One continuation decision, taken as a single reservation.
+enum Reservation {
+    /// Booked; the caller sends the request.
+    Request,
+    /// Parked until processing catches up.
+    Deferred,
+    /// The preview has nothing left to ask for.
+    Exhausted,
+}
+
+/// What a whole window of silence means for the drain.
+pub(crate) enum SilentDrain {
+    /// Our own pacing is holding the drain open: wait instead of completing.
+    Backpressure,
+    /// Nothing is in a lane: the server stopped, and the resume completes.
+    Idle,
+}
+
+impl Pacing {
+    fn new(generation: u64, total: usize) -> Self {
+        Self {
+            generation,
+            state: std::sync::Mutex::new(PacingState {
+                unbooked: total,
+                ..PacingState::default()
+            }),
+        }
+    }
+
+    /// The one lock every transition takes. A poisoned mutex still holds a
+    /// consistent state, so recovery is the right answer here.
+    fn state(&self) -> std::sync::MutexGuard<'_, PacingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The first request of a drain, booked with the arm.
+    fn book_first(&self) {
+        self.state().book();
+    }
+
+    /// Decide one continuation: check the gate and book the request as one
+    /// transition, so a request is never sent unreserved.
+    fn reserve(&self) -> Reservation {
+        let mut state = self.state();
+        if state.unbooked == 0 {
+            return Reservation::Exhausted;
+        }
+        if state.outstanding > BATCH_SIZE as usize {
+            state.deferred = true;
+            return Reservation::Deferred;
+        }
+        state.book();
+        Reservation::Request
+    }
+
+    fn admit_lane_bound(&self) {
+        // `outstanding` is untouched: the stanza was booked when the request
+        // that delivered it was decided, and admission only moves its finish
+        // from arrival to the guard on its queue entry.
+        self.state().admitted += 1;
+    }
+
+    /// One lane-bound message is done with — processed, cancelled, refused, or
+    /// dropped with its queue. `true` means this finish resolved a parked
+    /// request, which the caller must send.
+    fn finish_admitted(&self) -> bool {
+        let mut state = self.state();
+        state.settle_one();
+        state.admitted = state.admitted.saturating_sub(1);
+        state.release_deferred()
+    }
+
+    /// One offline stanza that no lane holds is done with.
+    fn finish_arrival(&self) -> bool {
+        let mut state = self.state();
+        state.settle_one();
+        state.release_deferred()
+    }
+
+    /// Decide what a window without a single offline stanza means.
+    ///
+    /// Silence never settles what the server still owes: a late response is
+    /// not an absent one, and booking another batch on top of it is exactly
+    /// how a lane would be handed a third. With nothing in a lane, the resume
+    /// completes as it did before pacing, and no further request leaves.
+    fn settle_silent(&self) -> SilentDrain {
+        if self.state().admitted > 0 {
+            SilentDrain::Backpressure
+        } else {
+            SilentDrain::Idle
+        }
+    }
+}
+
+impl PacingState {
+    fn settle_one(&mut self) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+    }
+
+    /// Take one request's worth out of the preview — never more than is left.
+    fn book(&mut self) {
+        let booking = (BATCH_SIZE as usize).min(self.unbooked);
+        self.unbooked -= booking;
+        self.outstanding += booking;
+    }
+
+    /// Release a parked continuation if this finish brought the lane back
+    /// within one batch. Decided under the same lock that parked it, so the
+    /// finish that opens the gate can never miss it.
+    fn release_deferred(&mut self) -> bool {
+        if !self.deferred || self.outstanding > BATCH_SIZE as usize {
+            return false;
+        }
+        self.deferred = false;
+        if self.unbooked == 0 {
+            // Everything announced is booked; the end marker ends the drain.
+            return false;
+        }
+        self.book();
+        true
+    }
+}
+
+/// One queued offline message's claim on its generation's pacing (S3).
+///
+/// Counted when the handler decides to queue it and settled when the queued
+/// item is dropped, so finishing, cancelling, refusing and tearing the queue
+/// down all settle it by the same path: nothing a lane was handed can keep the
+/// resume waiting after the lane let go of it.
+pub(crate) struct OfflinePendingGuard {
+    client: Arc<Client>,
+    /// The generation's pacing object, not a counter: a guard retired by a
+    /// reconnect can only ever settle what it was minted with.
+    pacing: Arc<Pacing>,
+}
+
+impl Drop for OfflinePendingGuard {
+    fn drop(&mut self) {
+        if !self.pacing.finish_admitted() {
+            return;
+        }
+        // The send is its own task: a lane worker finishing a message never
+        // waits on the socket for the request it just released.
+        spawn_deferred_continuation(Arc::clone(&self.client), self.pacing.generation);
+    }
 }
 
 /// Mirrors `WASmaxOutOfflineBatchRequest.makeBatchRequest`.
@@ -145,7 +395,7 @@ pub(crate) fn build_offline_batch_request(count: u32) -> Node {
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.offline_first_batch", level = "debug", skip_all, fields(total = total)))]
 pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
     let generation = client.connection_generation.load(Ordering::Acquire);
-    client.offline_batch.arm(generation);
+    client.offline_batch.arm(generation, total);
     log::info!(
         target: "Client/OfflineResume",
         "Resume armed: total={}, requesting first batch of {}",
@@ -203,6 +453,17 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
                     seen = client.offline_batch.stanza_activity();
                     continue;
                 }
+                // Silence alone does not mean the server gave up: the drain may
+                // be waiting on a lane we are still feeding, or on a request we
+                // parked ourselves. Completing that would end a resume that is
+                // only being paced, and the deferred request would never leave.
+                match client.offline_batch.settle_silent_drain(generation) {
+                    SilentDrain::Backpressure => {
+                        seen = client.offline_batch.stanza_activity();
+                        continue;
+                    }
+                    SilentDrain::Idle => {}
+                }
                 let processed = client
                     .offline_sync_metrics
                     .processed_messages
@@ -228,13 +489,18 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
 /// Called from `process_node` after the per-stanza `processed_messages` bump.
 /// Drives the pull loop: the first stanza of every just-sent batch elects
 /// itself via CAS and schedules the next batch (debounced 100ms).
-pub(crate) fn on_offline_stanza_arrived(client: &Arc<Client>, pending: usize) {
+pub(crate) fn on_offline_stanza_arrived(client: &Arc<Client>, pending: usize, lane_bound: bool) {
     let coord = &client.offline_batch;
     let generation = client.connection_generation.load(Ordering::Acquire);
-    if !coord.is_armed_for(generation) {
+    let Some(pacing) = coord.current_pacing(generation) else {
         return;
-    }
+    };
     coord.note_stanza_activity();
+    // A stanza no lane will hold is finished as it is handled; a lane-bound one
+    // is finished by the guard on its queue entry, so its arrival moves nothing.
+    if !lane_bound && pacing.finish_arrival() {
+        spawn_deferred_continuation(Arc::clone(client), generation);
+    }
     if pending == 0 {
         // Server has nothing more for us; let the end marker drive completion.
         return;
@@ -263,28 +529,80 @@ fn schedule_continuation(client: Arc<Client>, generation: u64) {
     runtime
         .spawn(Box::pin(async move {
             client.runtime.sleep(REQUEST_DEBOUNCE).await;
-            if !client.offline_batch.is_armed_for(generation) {
+            if !continuation_allowed(&client, generation) {
                 return;
             }
-            if client.connection_generation.load(Ordering::Acquire) != generation {
+            let Some(pacing) = client.offline_batch.current_pacing(generation) else {
                 return;
+            };
+            match pacing.reserve() {
+                Reservation::Request => {
+                    debug!(
+                        target: "Client/OfflineResume",
+                        "Continuation batch (count={})",
+                        BATCH_SIZE,
+                    );
+                    send_continuation(&client, generation).await;
+                }
+                // Parked under the lock that settles finishes, so the finish
+                // that opens the gate always sees it. Nothing here waits.
+                Reservation::Deferred => debug!(
+                    target: "Client/OfflineResume",
+                    "Continuation batch (count={}) deferred until the lane catches up",
+                    BATCH_SIZE,
+                ),
+                // Everything the preview announced is already booked; only the
+                // end marker (or the watchdog) has anything left to do.
+                Reservation::Exhausted => {}
             }
-            if client.offline_sync_completed.load(Ordering::Acquire) {
+        }))
+        .detach();
+}
+
+/// Finish an offline stanza that was counted as lane-bound on arrival but never
+/// reached the message handler (a stanza interceptor claimed it), so nothing
+/// else will ever settle it.
+pub(crate) fn finish_unqueued(client: &Arc<Client>, generation: u64) {
+    if let Some(pacing) = client.offline_batch.current_pacing(generation)
+        && pacing.finish_arrival()
+    {
+        spawn_deferred_continuation(Arc::clone(client), generation);
+    }
+}
+
+/// What every continuation send starts with: the resume must still be this
+/// connection's, and that connection must still be draining.
+fn continuation_allowed(client: &Client, generation: u64) -> bool {
+    client.offline_batch.is_armed_for(generation)
+        && client.connection_generation.load(Ordering::Acquire) == generation
+        && !client.offline_sync_completed.load(Ordering::Acquire)
+}
+
+async fn send_continuation(client: &Client, generation: u64) {
+    let _ = send_batch(client, BATCH_SIZE).await;
+    // Re-check generation after the await: a disconnect+reconnect+rearm
+    // during the send would leave the coordinator owned by a newer
+    // cycle, and republishing here would overwrite that cycle's CAS
+    // state and let a duplicate continuation slip through.
+    if client.offline_batch.is_armed_for(generation) {
+        client.offline_batch.mark_batch_inflight();
+    }
+}
+
+/// Send the request a debounce had to defer, once something opened the gate.
+fn spawn_deferred_continuation(client: Arc<Client>, generation: u64) {
+    let runtime = client.runtime.clone();
+    runtime
+        .spawn(Box::pin(async move {
+            if !continuation_allowed(&client, generation) {
                 return;
             }
             debug!(
                 target: "Client/OfflineResume",
-                "Continuation batch (count={})",
+                "Deferred continuation batch (count={}) once the lane caught up",
                 BATCH_SIZE,
             );
-            let _ = send_batch(&client, BATCH_SIZE).await;
-            // Re-check generation after the await: a disconnect+reconnect+rearm
-            // during the send would leave the coordinator owned by a newer
-            // cycle, and republishing here would overwrite that cycle's CAS
-            // state and let a duplicate continuation slip through.
-            if client.offline_batch.is_armed_for(generation) {
-                client.offline_batch.mark_batch_inflight();
-            }
+            send_continuation(&client, generation).await;
         }))
         .detach();
 }
@@ -329,7 +647,7 @@ mod tests {
     fn arm_publishes_first_batch_inflight() {
         let c = OfflineBatchCoordinator::new();
         assert!(!c.is_armed_for(42));
-        c.arm(42);
+        c.arm(42, 1_000);
         assert!(c.is_armed_for(42));
         assert!(!c.is_armed_for(43), "stale generation must not be armed");
         assert!(
@@ -345,7 +663,7 @@ mod tests {
     #[test]
     fn reset_disarms_and_clears_inflight() {
         let c = OfflineBatchCoordinator::new();
-        c.arm(7);
+        c.arm(7, 1_000);
         c.reset();
         assert!(!c.is_armed_for(7));
         assert!(

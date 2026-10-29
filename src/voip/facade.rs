@@ -1043,8 +1043,11 @@ impl<'a> OutgoingGroupCall<'a> {
             .ok_or(CallError::CallEndedDuringSetup)?;
         let transition_guard = transition_lock.lock().await;
         registration.ensure_current()?;
-        let applied =
-            registry.apply_group_update_if_current(ack_update.clone(), registration.generation);
+        // The ack carries the roster the service accepted and not yet the update-plane integers,
+        // so it is admitted as the initial partial snapshot a call may hold. Waiting for the first
+        // `group_update` instead would stall an accepted call before its relay is set up.
+        let applied = registry
+            .apply_initial_offer_ack_if_current(ack_update.clone(), registration.generation);
         if !matches!(
             applied,
             wacore::voip_control::group::GroupStateApply::Applied
@@ -1494,9 +1497,32 @@ fn group_offer_epoch_update<'a>(
     current_update: &'a GroupCallUpdate,
     retained_epoch: Option<u32>,
 ) -> Option<&'a GroupCallUpdate> {
-    (ack_update.rekey_requested
-        && retained_epoch.is_none_or(|transaction| transaction < ack_update.transaction_id))
-    .then_some(current_update)
+    if !ack_update.rekey_requested {
+        return None;
+    }
+    // A transaction-zero roster is the ack's partial one: no roster transaction has been
+    // ordered, so there is no valid key transaction to fan out under — `build_group_enc_rekey`
+    // refuses zero and an accepted ack would abort its own call setup. The request is parked
+    // on the call at admission instead and taken from there by the first fresh ordered roster
+    // on the update path (`take_group_rekey_request_if_current`), whether or not that update
+    // repeats the flag.
+    if current_update.transaction_id == 0 {
+        return None;
+    }
+    // The retained-equal/newer suppression answers the ordering question against the
+    // transaction that carries the request: the ack's own when it states one, and the overtaking
+    // roster's when the ack's transaction is zero — an ordered roster that arrived first makes
+    // the ack stale, so nothing parks its request and this comparison is all that answers it;
+    // comparing against zero would suppress every fan-out while a retained older epoch sits
+    // beside the newer roster.
+    let requested = if ack_update.transaction_id == 0 {
+        current_update.transaction_id
+    } else {
+        ack_update.transaction_id
+    };
+    retained_epoch
+        .is_none_or(|transaction| transaction < requested)
+        .then_some(current_update)
 }
 
 fn ensure_call_link_admitted_media(
@@ -6034,6 +6060,62 @@ mod tests {
         assert!(group_offer_epoch_update(&ack, &current, Some(4)).is_some());
         assert!(group_offer_epoch_update(&ack, &current, Some(5)).is_none());
         assert!(group_offer_epoch_update(&ack, &current, Some(6)).is_none());
+    }
+
+    /// An accepted ack may arrive with neither update-plane integer and still request a rekey.
+    /// Its roster holds transaction zero — no roster transaction has been ordered — and a key
+    /// fan-out is built for one transaction id, so the request waits instead of aborting the
+    /// offer on a stanza `build_group_enc_rekey` would refuse to build.
+    #[test]
+    fn a_transaction_zero_offer_ack_defers_its_rekey_request() {
+        let partial = |transaction_id: u32| {
+            GroupCallUpdate::builder()
+                .call_id("GROUP-CALL".to_string())
+                .call_creator(Jid::new("111111111111111", Server::Lid))
+                .transaction_id(transaction_id)
+                .media("audio".to_string())
+                .connected_limit(0)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(true)
+                .participants(Vec::new())
+                .build()
+        };
+        let ack = partial(0);
+
+        assert!(
+            group_offer_epoch_update(&ack, &ack, None).is_none(),
+            "the partial roster carries no valid key transaction to fan out under"
+        );
+
+        let mut ordered = partial(1);
+        ordered.rekey_requested = false;
+        assert_eq!(
+            group_offer_epoch_update(&ack, &ordered, None).map(|update| update.transaction_id),
+            Some(1),
+            "an ordered roster overtaking the ack answers its request at its own transaction"
+        );
+
+        let fulfilled = partial(1);
+        assert!(
+            group_offer_epoch_update(&fulfilled, &ordered, Some(1)).is_none(),
+            "a retained equal epoch still stands in for a new fan-out"
+        );
+
+        // When an ordered roster arrives before the ack, the ack reports stale and parks
+        // nothing: the suppression must then be judged against the roster that carries the
+        // request — against zero, every retained epoch would suppress a roster that has none.
+        let mut newer = partial(2);
+        newer.rekey_requested = false;
+        assert_eq!(
+            group_offer_epoch_update(&ack, &newer, Some(1)).map(|update| update.transaction_id),
+            Some(2),
+            "a retained epoch older than the overtaking roster does not answer this request"
+        );
+        assert!(
+            group_offer_epoch_update(&ack, &newer, Some(2)).is_none(),
+            "a retained epoch equal to the overtaking roster already answers it"
+        );
     }
 
     #[test]

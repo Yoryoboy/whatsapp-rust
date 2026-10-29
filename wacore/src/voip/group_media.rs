@@ -753,8 +753,15 @@ impl GroupMediaRegistry {
         if update.call_id != self.call_id || update.call_creator != self.call_creator {
             return Err(GroupMediaError::IdentityMismatch);
         }
-        if update.transaction_id == 0
-            || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
+        // Transaction zero is the offer ack's partial roster: no roster transaction has been
+        // ordered, and media startup is where the registry holds no roster either — the same
+        // boundary the control plane draws when it admits that ack. A replay of that same roster
+        // (media startup configures the engine with it, then queues the committed snapshot once
+        // more) must not be refused here: the stale check below reports it `Stale` without
+        // touching state, since zero cannot exceed any roster transaction and can therefore
+        // never replace one. Refusing it instead would publish a rejection for a roster this
+        // registry already accepted.
+        if update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
             || !matches!(update.media.as_str(), "audio" | "video")
         {
             return Err(GroupMediaError::InvalidSnapshot);
@@ -811,6 +818,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new(user, Server::Lid).with_device(device),
                 platform: None,
@@ -1092,6 +1100,43 @@ mod tests {
                 "{route} route collision must preserve the active roster"
             );
         }
+    }
+
+    /// The offer ack's partial roster carries transaction zero, and media startup is where the
+    /// registry holds no roster yet: it is admitted exactly there. Startup then queues that same
+    /// committed roster once more, which must be ignored as a replay — stale, not a rejection of
+    /// a roster this registry already accepted — and zero must never displace an ordered roster.
+    #[test]
+    fn a_transaction_zero_roster_is_admitted_only_as_the_first() {
+        let mut registry = registry();
+        let partial = update(0, vec![device("100001", 1, 1)]);
+        assert_eq!(
+            registry.apply_group_update(&partial),
+            Ok(GroupRosterApply::Applied),
+            "the ack's partial roster is the registry's first roster"
+        );
+        assert_eq!(registry.roster_transaction(), Some(0));
+
+        assert_eq!(
+            registry.apply_group_update(&partial),
+            Ok(GroupRosterApply::Stale),
+            "the startup replay of the accepted roster is stale, not a rejection event"
+        );
+        assert_eq!(registry.roster_transaction(), Some(0));
+
+        assert_eq!(
+            registry.apply_group_update(&update(1, vec![device("100001", 1, 1)])),
+            Ok(GroupRosterApply::Applied),
+            "the first ordered roster still advances it"
+        );
+        assert_eq!(registry.roster_transaction(), Some(1));
+
+        assert_eq!(
+            registry.apply_group_update(&partial),
+            Ok(GroupRosterApply::Stale),
+            "a zero-transaction roster can never replace an ordered one"
+        );
+        assert_eq!(registry.roster_transaction(), Some(1));
     }
 
     #[test]

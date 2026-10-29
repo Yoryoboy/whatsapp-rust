@@ -930,7 +930,7 @@ impl CallRegistry {
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
     pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
-        self.apply_group_update_inner(update, None).0
+        self.apply_group_update_inner(update, None, false).0
     }
 
     /// Apply a group snapshot only while `generation` still owns this call-id.
@@ -939,7 +939,43 @@ impl CallRegistry {
         update: GroupCallUpdate,
         generation: u64,
     ) -> GroupStateApply {
-        self.apply_group_update_inner(update, Some(generation)).0
+        self.apply_group_update_inner(update, Some(generation), false)
+            .0
+    }
+
+    /// Admit the partial snapshot an initial `offer` ack carries, only while `generation` still owns
+    /// this call-id.
+    ///
+    /// The ack states the roster the service accepted before any roster transaction exists, so it
+    /// is admitted where a roster the service has already ordered would be rejected. Bounded to a
+    /// call that holds no snapshot yet: every later snapshot goes through the strict path.
+    pub fn apply_initial_offer_ack_if_current(
+        &self,
+        update: GroupCallUpdate,
+        generation: u64,
+    ) -> GroupStateApply {
+        self.apply_group_update_inner(update, Some(generation), true)
+            .0
+    }
+
+    /// Take the rekey request an initial `offer` ack left outstanding for this call generation.
+    ///
+    /// A transaction-zero ack cannot carry a fan-out, so its request is parked when the ack is
+    /// admitted and answered by the first fresh ordered roster on the update path. Consumed
+    /// exactly once, and only while `generation` still owns the call-id: a superseded or
+    /// removed generation hands nothing out.
+    pub fn take_group_rekey_request_if_current(&self, call_id: &str, generation: u64) -> bool {
+        let mut map = self.active_calls();
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        let Some(group) = entry.group.as_mut() else {
+            return false;
+        };
+        group.take_owed_rekey()
     }
 
     /// Apply an update and return its exact committed roster only when the roster advances.
@@ -952,13 +988,14 @@ impl CallRegistry {
         update: GroupCallUpdate,
         generation: u64,
     ) -> (GroupStateApply, Option<GroupCallUpdate>) {
-        self.apply_group_update_inner(update, Some(generation))
+        self.apply_group_update_inner(update, Some(generation), false)
     }
 
     fn apply_group_update_inner(
         &self,
         update: GroupCallUpdate,
         generation: Option<u64>,
+        initial_offer_ack: bool,
     ) -> (GroupStateApply, Option<GroupCallUpdate>) {
         if crate::voip_control::group::validate_group_relay_update(&update).is_err() {
             return (GroupStateApply::InvalidSnapshot, None);
@@ -999,7 +1036,11 @@ impl CallRegistry {
                 )
             });
             let previous_transaction = preview.snapshot().map(|snapshot| snapshot.transaction_id);
-            let applied = preview.apply_update(update);
+            let applied = if initial_offer_ack {
+                preview.apply_initial_offer_ack(update)
+            } else {
+                preview.apply_update(update)
+            };
             // Relay-only adoption cannot authorize membership from its obsolete carrying roster.
             let local_member = preview.snapshot().is_some_and(|committed| {
                 entry
@@ -3920,6 +3961,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![crate::types::group_call::GroupCallDevice {
                 jid: Jid::new("100001", Server::Lid).with_device(1),
                 platform: None,
@@ -4263,6 +4305,94 @@ mod tests {
         assert!(reg.is_group_call("GROUP-CALL"));
         assert!(reg.group_state("GROUP-CALL").is_none());
         assert!(reg.remove_if_current("GROUP-CALL", generation));
+    }
+
+    /// The partial snapshot an initial `offer` ack carries is admitted for the outgoing call it
+    /// answers, and only there: the ordinary path still requires both update-plane integers, a
+    /// superseded generation cannot admit it, and the ack's own snapshot is not admitted twice.
+    #[test]
+    fn a_partial_offer_ack_is_admitted_for_the_outgoing_call_it_answers() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert_group(session("GROUP-CALL"));
+        let mut partial = group_update(0);
+        partial.connected_limit = 0;
+        assert_eq!(
+            partial.transaction_id, 0,
+            "the ack names no roster transaction yet"
+        );
+
+        assert_eq!(
+            reg.apply_group_update_if_current(partial.clone(), generation),
+            GroupStateApply::InvalidSnapshot,
+            "an ordered roster still states both update-plane integers"
+        );
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(partial.clone(), generation + 1),
+            GroupStateApply::UnknownCall,
+            "a superseded generation cannot admit the ack"
+        );
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(partial.clone(), generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(0),
+            "the ack's roster is the call's snapshot until the service orders one"
+        );
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(partial, generation),
+            GroupStateApply::Stale,
+            "the call already holds an ordered roster, so the partial ack is reported overtaken"
+        );
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(1), generation),
+            GroupStateApply::Applied,
+            "the first ordered roster still advances the call"
+        );
+    }
+
+    /// The ack's rekey request outlives the setup that could not answer it: parked only when
+    /// the ack is actually admitted, held against this generation alone, and handed out once so
+    /// the update path can answer it with the first ordered roster's real transaction.
+    #[test]
+    fn an_admitted_ack_parks_its_rekey_request_until_the_update_path_takes_it() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert_group(session("GROUP-CALL"));
+        let mut partial = group_update(0);
+        partial.connected_limit = 0;
+        partial.rekey_requested = true;
+
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(partial.clone(), generation),
+            GroupStateApply::Applied
+        );
+        assert!(
+            !reg.take_group_rekey_request_if_current("GROUP-CALL", generation + 1),
+            "a superseded generation holds nothing to take"
+        );
+        assert!(
+            reg.take_group_rekey_request_if_current("GROUP-CALL", generation),
+            "the admitted ack's request is available to the update path"
+        );
+        assert!(
+            !reg.take_group_rekey_request_if_current("GROUP-CALL", generation),
+            "and is consumed exactly once"
+        );
+        assert!(!reg.take_group_rekey_request_if_current("OTHER-CALL", generation));
+        assert!(reg.remove_if_current("GROUP-CALL", generation));
+
+        // An ack that asked for nothing parks nothing.
+        let reg = CallRegistry::new();
+        let generation = reg.insert_group(session("GROUP-CALL"));
+        let mut quiet = group_update(0);
+        quiet.connected_limit = 0;
+        assert_eq!(
+            reg.apply_initial_offer_ack_if_current(quiet, generation),
+            GroupStateApply::Applied
+        );
+        assert!(!reg.take_group_rekey_request_if_current("GROUP-CALL", generation));
     }
 
     #[test]
@@ -4737,6 +4867,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new("222222222222222", Server::Lid).with_device(1),
                 platform: Some("web".to_string()),
@@ -4768,6 +4899,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new("222222222222222", Server::Lid).with_device(1),
                 platform: Some("web".to_string()),
@@ -4858,6 +4990,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new("222222222222222", Server::Lid).with_device(1),
                 platform: Some("web".to_string()),
@@ -4928,6 +5061,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new("222222222222222", Server::Lid).with_device(1),
                 platform: Some("web".to_string()),
@@ -4978,6 +5112,7 @@ mod tests {
             pn: None,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new("222222222222222", Server::Lid).with_device(1),
                 platform: Some("web".to_string()),
@@ -6591,6 +6726,7 @@ mod tests {
             pn,
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: jid.clone().with_device(1),
                 platform: None,
@@ -6676,6 +6812,7 @@ mod tests {
             pn: Some(pn),
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: lid.clone().with_device(1),
                 platform: None,
@@ -6723,6 +6860,7 @@ mod tests {
             pn: Some(pn.clone()),
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: lid.clone().with_device(1),
                 platform: None,
@@ -6782,6 +6920,7 @@ mod tests {
                     pn: None,
                     state: Some("connected".to_string()),
                     participant_type: None,
+                    error: None,
                     devices: vec![GroupCallDevice {
                         jid: jid.clone().with_device(1),
                         platform: None,
@@ -6849,6 +6988,7 @@ mod tests {
                     pn: None,
                     state: Some("connected".to_string()),
                     participant_type: None,
+                    error: None,
                     devices: Vec::new(),
                 })
                 .collect();
@@ -6937,6 +7077,7 @@ mod tests {
             pn: Some(pn),
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: Vec::new(),
         }];
         assert_eq!(reg.apply_group_update(admitted), GroupStateApply::Applied);
@@ -6971,6 +7112,7 @@ mod tests {
             pn: Some(pn.clone()),
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: lid.clone().with_device(3),
                 platform: None,
@@ -7016,6 +7158,7 @@ mod tests {
             pn: Some(pn),
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: [3u16, 9]
                 .into_iter()
                 .map(|device| GroupCallDevice {
@@ -7055,6 +7198,7 @@ mod tests {
                 pn: Some(pn.clone()),
                 state: Some("connected".to_string()),
                 participant_type: None,
+                error: None,
                 devices: Vec::new(),
             }];
             update
@@ -7103,6 +7247,7 @@ mod tests {
             pn: Some(pn.clone()),
             state: Some("connected".to_string()),
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: lid.clone().with_device(4),
                 platform: None,

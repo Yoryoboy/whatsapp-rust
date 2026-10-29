@@ -289,6 +289,43 @@ enum GroupSnapshotEnvelope {
     Ack,
 }
 
+/// How the call service answered an initial group offer.
+///
+/// The initial offer ack is the only snapshot whose parser does not run through
+/// `validate_call_ack`, so its `error` attribute is classified here instead of being read as a
+/// whole-call refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OfferAckStatus {
+    /// No `error` attribute, an empty one, or `0`: the action was served.
+    Success,
+    /// `207`, multi-status: the ack itself was served while individual participants failed, so
+    /// the snapshot beside it still describes the call and carries their per-entry errors.
+    MultiStatus,
+    /// Any other code the service named: the action was refused.
+    Refused(String),
+}
+
+/// Classify a group-call ack's top-level `error` as a status. An absent attribute is `0`, which
+/// is the value WA Web dispatches (`maybeAttrString("error") ?? "0"` in
+/// `WAWebVoipSendSignalingXmpp`), and the service's own offer-ack deserializer continues for `0`
+/// and `207` only — every other code stops the action there. This is the ack's status alone:
+/// a failing participant reports its own code on its roster entry, and the two never substitute
+/// for one another.
+fn offer_ack_status(node: &NodeRef<'_>) -> OfferAckStatus {
+    let Some(status) = node
+        .get_attr("error")
+        .map(|value| value.as_str().into_owned())
+        .filter(|status| !status.is_empty())
+    else {
+        return OfferAckStatus::Success;
+    };
+    match status.as_str() {
+        "0" => OfferAckStatus::Success,
+        "207" => OfferAckStatus::MultiStatus,
+        _ => OfferAckStatus::Refused(status),
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn parse_group_snapshot(
@@ -302,6 +339,19 @@ fn parse_group_snapshot(
     };
     if node.tag != expected_tag {
         return Err(group_stanza_error("unexpected group snapshot envelope"));
+    }
+    // The ack's `error` is a status, not by itself a refusal of the whole call: `0` serves the
+    // action and `207` serves it while individual participants fail, and both still deliver the
+    // snapshot — and each entry's own error — below. Only another code stops the action, and it
+    // surfaces here with its code so a real refusal such as `427` stays visible; without this a
+    // successful ack would be read as a refusal and a `207` would discard the roster it carries.
+    if matches!(envelope, GroupSnapshotEnvelope::Ack) {
+        match offer_ack_status(node) {
+            OfferAckStatus::Success | OfferAckStatus::MultiStatus => {}
+            OfferAckStatus::Refused(code) => {
+                return Err(anyhow!("group offer rejected with error {code}"));
+            }
+        }
     }
 
     let group_info = node.get_optional_child("group_info");
@@ -325,7 +375,7 @@ fn parse_group_snapshot(
         finish_attrs(&attrs)?;
     }
 
-    let mut update = parse_group_info(group_info, call_id, call_creator)?;
+    let mut update = parse_group_info(group_info, envelope, call_id, call_creator)?;
     match envelope {
         GroupSnapshotEnvelope::Offer => {
             if let Some(group_jid) = attrs.optional_jid("group-jid") {
@@ -378,14 +428,29 @@ fn parse_group_snapshot(
 #[inline(never)]
 fn parse_group_info(
     node: &NodeRef<'_>,
+    envelope: GroupSnapshotEnvelope,
     call_id: String,
     call_creator: Jid,
 ) -> Result<GroupCallUpdate> {
     let mut attrs = node.attrs();
     let group_jid = attrs.optional_jid("group-jid");
     let media = required_string(&mut attrs, "media")?;
-    let transaction_id = required_u32(&mut attrs, "transaction-id")?;
-    let connected_limit = required_u32(&mut attrs, "connected-limit")?;
+    // The initial offer's ack carries the authoritative roster as a partial snapshot: identity,
+    // media and participants. The ordering `transaction-id` and the `connected-limit` are
+    // update-plane state and arrive on the first `group_update`, so an ack that omits them is not
+    // malformed and must not be refused. Zero is exactly the state a freshly acked offer is in:
+    // no ordering transaction has been applied yet, and zero already means "no connected limit".
+    // The signed `offer`/`group_update` envelopes still require both.
+    let (transaction_id, connected_limit) = match envelope {
+        GroupSnapshotEnvelope::Ack => (
+            optional_u32(&mut attrs, "transaction-id")?.unwrap_or(0),
+            optional_u32(&mut attrs, "connected-limit")?.unwrap_or(0),
+        ),
+        GroupSnapshotEnvelope::Offer | GroupSnapshotEnvelope::Update => (
+            required_u32(&mut attrs, "transaction-id")?,
+            required_u32(&mut attrs, "connected-limit")?,
+        ),
+    };
     let joinable = attrs.optional_string("joinable").as_deref() == Some("1");
     let rekey_requested = attrs.optional_string("rekey").as_deref() == Some("1");
     let mut participants = Vec::new();
@@ -421,6 +486,10 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
     let participant_type = attrs
         .optional_string("type")
         .map(|value| value.into_owned());
+    // The service's NACK code for this entry (`<user error="...">`). It rides on the roster entry
+    // itself, never on the ack, which is what keeps a `207` ack's success and this participant's
+    // failure as two separate, separately preserved facts.
+    let error = optional_u32(&mut attrs, "error")?;
     let mut devices = Vec::new();
     for child in node.children().unwrap_or_default() {
         if child.tag == "device" {
@@ -432,6 +501,7 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
         .maybe_pn(pn)
         .maybe_state(state)
         .maybe_participant_type(participant_type)
+        .maybe_error(error)
         .devices(devices)
         .build())
 }
@@ -1311,6 +1381,7 @@ mod tests {
             pn: None,
             state: None,
             participant_type: None,
+            error: None,
             devices: vec![GroupCallDevice {
                 jid: jid(user, device),
                 platform: None,
@@ -1761,6 +1832,317 @@ mod tests {
             .expect("valid offer")
             .expect("group snapshot");
         assert!(update.joinable);
+    }
+
+    /// The live call service answers an initial group offer with an ack whose `group_info` is a
+    /// partial snapshot: identity, media and roster, but none of the update-plane integers. Those
+    /// arrive on the first `group_update`, so such an ack must parse rather than be refused as a
+    /// missing integer, with the ordering transaction at zero and no connected limit.
+    #[test]
+    fn group_offer_ack_without_update_plane_integers_parses() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("id", "REQ-1")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .children([NodeBuilder::new("user")
+                    .attr("jid", &creator)
+                    .children([NodeBuilder::new("device")
+                        .attr("jid", jid("100001", 1))
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("a partial ack snapshot parses")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "CID");
+        assert_eq!(update.call_creator, creator);
+        assert_eq!(update.media, "audio");
+        assert_eq!(update.transaction_id, 0);
+        assert_eq!(update.connected_limit, 0);
+        assert_eq!(update.participants.len(), 1);
+    }
+
+    /// An ack that does carry the update-plane integers keeps them: the ack envelope tolerates
+    /// their absence, it does not discard what the service actually sent.
+    #[test]
+    fn group_offer_ack_keeps_update_plane_integers_when_present() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .attr("transaction-id", "13")
+                .attr("connected-limit", "32")
+                .build()])
+            .build();
+
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("an ack carrying the update-plane integers parses")
+            .expect("group snapshot");
+        assert_eq!(update.transaction_id, 13);
+        assert_eq!(update.connected_limit, 32);
+    }
+
+    /// The service refuses a group offer it will not serve by naming an error code on the ack
+    /// instead of returning a snapshot; 427 is the code it returns where group calling from a
+    /// linked device is not enabled for the account. The refusal must be reported as one, not read
+    /// as a malformed snapshot or a missing integer.
+    #[test]
+    fn group_offer_ack_naming_error_427_is_a_refusal() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("error", "427")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        let error = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect_err("a refusal is not a snapshot");
+        assert!(
+            error.to_string().contains("rejected with error 427"),
+            "unexpected parse error: {error:#}"
+        );
+    }
+
+    /// Only the ack relaxes the two update-plane integers. An empty `error` attribute is not a
+    /// refusal either, so a partial ack that the service left an empty code on still parses.
+    #[test]
+    fn group_offer_ack_treats_an_empty_error_as_no_refusal() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("error", "")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("an empty error code is not a refusal")
+            .expect("group snapshot");
+        assert_eq!(update.transaction_id, 0);
+    }
+
+    /// The synthetic ack the status cases share: a complete `group_info` beside whatever
+    /// top-level `error` and per-entry `error` the case under test needs.
+    fn synthetic_status_ack(status: Option<&str>, participant_error: Option<&str>) -> Node {
+        let creator = jid("100001", 1);
+        let mut user = NodeBuilder::new("user")
+            .attr("jid", &creator)
+            .children([NodeBuilder::new("device")
+                .attr("jid", jid("100001", 1))
+                .build()]);
+        if let Some(code) = participant_error {
+            user = user.attr("error", code);
+        }
+        let mut ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .attr("id", "REQ-1")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "SYNTHETIC")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .attr("transaction-id", "1")
+                .attr("connected-limit", "32")
+                .children([user.build()])
+                .build()]);
+        if let Some(code) = status {
+            ack = ack.attr("error", code);
+        }
+        ack.build()
+    }
+
+    /// No `error` attribute is status `0` — the default WA Web dispatches — so the ack's
+    /// snapshot is processed instead of being read as a refusal.
+    #[test]
+    fn an_offer_ack_without_a_status_is_a_success() {
+        let update = parse_initial_group_call_ack(&synthetic_status_ack(None, None).as_node_ref())
+            .expect("a status-less ack parses")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "SYNTHETIC");
+        assert_eq!(update.transaction_id, 1);
+        assert_eq!(update.connected_limit, 32);
+        assert_eq!(update.participants.len(), 1);
+    }
+
+    /// `error="0"` is an explicit success: the complete snapshot beside it is processed.
+    #[test]
+    fn an_offer_ack_with_status_zero_is_a_success() {
+        let ack = synthetic_status_ack(Some("0"), None);
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("status 0 is a success")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "SYNTHETIC");
+        assert_eq!(update.transaction_id, 1);
+        assert_eq!(update.connected_limit, 32);
+    }
+
+    /// `error="207"` is multi-status: the ack was served while individual participants failed,
+    /// so the snapshot beside it is still processed rather than refused as a whole-call error.
+    #[test]
+    fn an_offer_ack_with_status_207_keeps_its_snapshot() {
+        let ack = synthetic_status_ack(Some("207"), None);
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("multi-status is not a refusal")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "SYNTHETIC");
+        assert_eq!(update.media, "audio");
+        assert_eq!(update.participants.len(), 1);
+    }
+
+    /// On a `207` ack the two errors stay apart: the ack's status says the call was served, and
+    /// the failing participant's code rides on that participant's own entry.
+    #[test]
+    fn a_207_ack_keeps_its_status_and_its_participant_errors_separate() {
+        let ack = synthetic_status_ack(Some("207"), Some("487"));
+        let update = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect("multi-status still delivers the call's snapshot")
+            .expect("group snapshot");
+        assert_eq!(update.call_id, "SYNTHETIC", "the ack itself was served");
+        assert_eq!(update.participants.len(), 1);
+        assert_eq!(
+            update.participants[0].error,
+            Some(487),
+            "the participant's own failure is preserved on its entry, not folded into the ack"
+        );
+    }
+
+    /// An unknown status is never silently a success: the code the service named comes back as a
+    /// refusal with that code intact, exactly like a known one.
+    #[test]
+    fn an_offer_ack_with_an_unknown_status_is_not_a_success() {
+        let ack = synthetic_status_ack(Some("500"), None);
+        let error = parse_initial_group_call_ack(&ack.as_node_ref())
+            .expect_err("an unknown status must not be read as success");
+        assert!(
+            error.to_string().contains("rejected with error 500"),
+            "unexpected parse error: {error:#}"
+        );
+    }
+
+    /// A served status says nothing about the snapshot's integrity: `group_info` that is broken
+    /// or absent is still refused under `0` and `207` alike, and no snapshot is fabricated.
+    #[test]
+    fn a_success_status_does_not_warrant_a_broken_snapshot() {
+        let creator = jid("100001", 1);
+        for status in ["0", "207"] {
+            let no_identity = NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "offer")
+                .attr("error", status)
+                .children([NodeBuilder::new("group_info")
+                    .attr("call-creator", &creator)
+                    .attr("media", "audio")
+                    .build()])
+                .build();
+            assert!(
+                parse_initial_group_call_ack(&no_identity.as_node_ref()).is_err(),
+                "status {status} must not warrant a snapshot without its identity"
+            );
+
+            let no_media = NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "offer")
+                .attr("error", status)
+                .children([NodeBuilder::new("group_info")
+                    .attr("call-id", "SYNTHETIC")
+                    .attr("call-creator", &creator)
+                    .build()])
+                .build();
+            assert!(
+                parse_initial_group_call_ack(&no_media.as_node_ref()).is_err(),
+                "status {status} must not warrant a snapshot without its media"
+            );
+
+            let bare = NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "offer")
+                .attr("error", status)
+                .build();
+            assert_eq!(
+                parse_initial_group_call_ack(&bare.as_node_ref()).expect("a bare ack parses"),
+                None,
+                "status {status} must not fabricate the group snapshot it does not carry"
+            );
+        }
+    }
+
+    /// The signed `offer` snapshot and the `group_update` envelope still require both update-plane
+    /// integers: the relaxation is scoped to the ack, not applied to the protocol at large.
+    #[test]
+    fn only_the_ack_relaxes_the_update_plane_integers() {
+        let creator = jid("100001", 1);
+        let offer = NodeBuilder::new(CallActionTag::Offer.as_str())
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .children([NodeBuilder::new("group_info")
+                .attr("media", "audio")
+                .build()])
+            .build();
+        assert!(
+            parse_group_invite_snapshot(&offer.as_node_ref()).is_err(),
+            "an offer snapshot without the update-plane integers is still malformed"
+        );
+    }
+
+    /// An ack whose present integer is not a number, and an ack-shaped node sent to the strict
+    /// `group_update` parser, are both refused rather than parsed into a snapshot.
+    #[test]
+    fn group_offer_ack_rejects_malformed_integers_and_a_wrong_envelope() {
+        let creator = jid("100001", 1);
+        let malformed = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .attr("transaction-id", "not-a-number")
+                .build()])
+            .build();
+        assert!(parse_initial_group_call_ack(&malformed.as_node_ref()).is_err());
+
+        let no_media = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "offer")
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .build()])
+            .build();
+        assert!(parse_initial_group_call_ack(&no_media.as_node_ref()).is_err());
+
+        let update = NodeBuilder::new(CallActionTag::GroupUpdate.as_str())
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .children([NodeBuilder::new("group_info")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("media", "audio")
+                .build()])
+            .build();
+        assert!(
+            parse_initial_group_call_ack(&update.as_node_ref()).is_err(),
+            "a group_update is not an ack envelope"
+        );
+        assert!(parse_group_update(&update.as_node_ref()).is_err());
     }
 
     #[test]

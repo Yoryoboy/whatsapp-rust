@@ -431,6 +431,58 @@ mod tests {
         drop(blocked);
     }
 
+    /// S3: the release belongs to the queued message, so a worker that ends
+    /// without processing it still lets the resume go on.
+    #[tokio::test]
+    async fn a_lane_worker_that_stops_releases_the_resume_admission() {
+        let client = crate::test_utils::create_test_client().await;
+        // The send fails without a socket; the arming is what this needs.
+        crate::client::offline_resume::send_first_batch(Arc::clone(&client), 10).await;
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("message")
+                .attr("from", chat)
+                .attr("id", "OFFLINE-1")
+                .attr("offline", "1")
+                .build(),
+        );
+        let offline = client
+            .offline_batch
+            .admit(&client, generation, &node)
+            .expect("an armed resume admits an offline message");
+        assert_eq!(client.offline_batch.admitted(), 1);
+        let outstanding = client.offline_batch.outstanding();
+
+        let keep = process_queued(
+            &client,
+            QueuedChatMessage {
+                node,
+                shutdown: client.connection_shutdown_signal(),
+                lane_liveness: Arc::new(async_lock::Mutex::new(())),
+                work: None,
+                offline: Some(offline),
+            },
+            // The worker outlived its connection: it stops without handling.
+            generation + 1,
+        )
+        .await;
+
+        assert!(!keep, "a stale worker must stop");
+        assert_eq!(
+            client.offline_batch.admitted(),
+            0,
+            "the admission is settled even though the handler never ran"
+        );
+        assert_eq!(
+            client.offline_batch.outstanding(),
+            outstanding - 1,
+            "and the stanza it arrived with is settled with it"
+        );
+    }
+
     fn message_for(chat: &Jid, id: &str) -> Arc<wacore_binary::OwnedNodeRef> {
         node_to_owned_ref(
             &NodeBuilder::new("message")

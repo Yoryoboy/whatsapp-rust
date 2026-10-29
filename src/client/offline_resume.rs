@@ -200,6 +200,30 @@ impl OfflineBatchCoordinator {
             pacing,
         }))
     }
+
+    #[cfg(test)]
+    fn test_pacing(&self) -> Option<Arc<Pacing>> {
+        let generation = self.generation.load(Ordering::Acquire);
+        self.current_pacing(generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self) -> usize {
+        self.test_pacing()
+            .map_or(0, |pacing| pacing.state().outstanding)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted(&self) -> usize {
+        self.test_pacing()
+            .map_or(0, |pacing| pacing.state().admitted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred(&self) -> bool {
+        self.test_pacing()
+            .is_some_and(|pacing| pacing.state().deferred)
+    }
 }
 
 /// Backlog pacing for one connection generation (S2-S4).
@@ -610,6 +634,7 @@ fn spawn_deferred_continuation(client: Arc<Client>, generation: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     #[test]
     fn batch_request_stanza_shape() {
@@ -669,6 +694,271 @@ mod tests {
         assert!(
             !c.try_claim_first_arrival(),
             "reset must leave prev_batch_inflight=false"
+        );
+        assert!(
+            c.current_pacing(7).is_none(),
+            "reset must retire the pacing object"
+        );
+    }
+
+    async fn armed_client(generation: u64, total: usize) -> Arc<Client> {
+        let client = crate::test_utils::create_test_client().await;
+        client.offline_batch.arm(generation, total);
+        client
+    }
+
+    fn offline_message_node() -> Arc<wacore_binary::OwnedNodeRef> {
+        crate::test_utils::node_to_owned_ref(
+            &NodeBuilder::new("message")
+                .attr("from", "120363000000000042@g.us")
+                .attr("id", "OFFLINE-1")
+                .attr("offline", "1")
+                .build(),
+        )
+    }
+
+    /// S2: the gate opens exactly while what the last requests still owe fits
+    /// one batch, and the check books the new request in the same transition.
+    #[tokio::test]
+    async fn the_gate_books_one_request_while_the_last_ones_fit_a_batch() {
+        let client = armed_client(7, 1_000).await;
+        let coord = &client.offline_batch;
+        assert_eq!(
+            coord.outstanding(),
+            BATCH_SIZE as usize,
+            "the first request is booked with the arm"
+        );
+        let pacing = coord.current_pacing(7).expect("armed");
+
+        assert!(
+            matches!(pacing.reserve(), Reservation::Request),
+            "one batch outstanding still fits another"
+        );
+        assert_eq!(coord.outstanding(), 2 * BATCH_SIZE as usize);
+        assert!(
+            matches!(pacing.reserve(), Reservation::Deferred),
+            "two batches is where a request has to wait"
+        );
+        assert_eq!(
+            coord.outstanding(),
+            2 * BATCH_SIZE as usize,
+            "a parked request books nothing"
+        );
+    }
+
+    /// The preview clamps every booking, so a request never asks for more than
+    /// the server announced and nothing is left parked once it is all booked.
+    #[tokio::test]
+    async fn a_request_never_books_more_than_the_preview_announced() {
+        let client = armed_client(7, 3).await;
+        let coord = &client.offline_batch;
+        assert_eq!(coord.outstanding(), 3, "three items, not a whole batch");
+        let pacing = coord.current_pacing(7).expect("armed");
+        assert!(matches!(pacing.reserve(), Reservation::Exhausted));
+        assert_eq!(coord.outstanding(), 3);
+    }
+
+    /// S3, blocker (3) as a named regression: a guard is bound to the pacing
+    /// object it was minted with, so a reconnect cannot make it settle the
+    /// live generation's counters.
+    #[tokio::test]
+    async fn a_stale_admission_guard_leaves_the_new_generations_pacing_alone() {
+        let client = armed_client(7, 1_000).await;
+        let node = offline_message_node();
+        let stale = client
+            .offline_batch
+            .admit(&client, 7, &node)
+            .expect("armed for generation 7");
+        assert_eq!(client.offline_batch.admitted(), 1);
+
+        client.offline_batch.reset();
+        client.offline_batch.arm(9, 1_000);
+        let live = client
+            .offline_batch
+            .admit(&client, 9, &node)
+            .expect("armed for generation 9");
+        let (outstanding, admitted) = (
+            client.offline_batch.outstanding(),
+            client.offline_batch.admitted(),
+        );
+
+        drop(stale);
+        assert_eq!(
+            (
+                client.offline_batch.outstanding(),
+                client.offline_batch.admitted()
+            ),
+            (outstanding, admitted),
+            "the retired connection's guard must not settle the new generation"
+        );
+        drop(live);
+        assert_eq!(
+            client.offline_batch.admitted(),
+            0,
+            "the live guard still settles its own generation"
+        );
+        assert_eq!(client.offline_batch.outstanding(), outstanding - 1);
+    }
+
+    /// S4: the finish that brings the lane back within one batch is the one
+    /// that releases the parked request. Parked and released are the same
+    /// object and the same lock, so there is no window to lose it in.
+    #[tokio::test]
+    async fn the_finish_that_opens_the_gate_releases_the_parked_request() {
+        let client = armed_client(7, 1_000).await;
+        let batch = BATCH_SIZE as usize;
+        let pacing = client.offline_batch.current_pacing(7).expect("armed");
+        assert!(
+            matches!(pacing.reserve(), Reservation::Request),
+            "the second request is booked while the first still fits"
+        );
+        for _ in 0..2 * batch {
+            pacing.admit_lane_bound();
+        }
+        assert_eq!(client.offline_batch.outstanding(), 2 * batch);
+        assert!(matches!(pacing.reserve(), Reservation::Deferred));
+        assert!(client.offline_batch.deferred());
+
+        // Every finish but the last one lands on a lane that is still over the
+        // gate, so none of them may claim the request.
+        let mut released = 0;
+        for _ in 0..batch - 1 {
+            released += usize::from(pacing.finish_admitted());
+        }
+        assert_eq!(released, 0);
+        assert!(
+            client.offline_batch.deferred(),
+            "still over the gate, still parked"
+        );
+
+        assert!(
+            pacing.finish_admitted(),
+            "the finish that reaches one batch releases it, exactly once"
+        );
+        assert!(!client.offline_batch.deferred());
+        assert_eq!(
+            client.offline_batch.outstanding(),
+            2 * batch,
+            "the released request is booked as it is released"
+        );
+    }
+
+    /// S4, blocker (2) as a named regression: in every interleaving of "the
+    /// debounce decides" and "the last messages finish", exactly one of the two
+    /// books the next request — there is no ordering in which both miss it.
+    #[test]
+    fn finishing_the_lane_while_a_request_is_being_deferred_always_releases_it() {
+        let total = 1_000;
+        let batch = BATCH_SIZE as usize;
+        for _ in 0..200 {
+            let pacing = Arc::new(Pacing::new(7, total));
+            // Two requests out, and the whole of both in one lane.
+            pacing.book_first();
+            assert!(matches!(pacing.reserve(), Reservation::Request));
+            for _ in 0..2 * batch {
+                pacing.admit_lane_bound();
+            }
+
+            let line_up = Arc::new(Barrier::new(2));
+            let bookings = std::thread::scope(|scope| {
+                let debounce = {
+                    let pacing = Arc::clone(&pacing);
+                    let line_up = Arc::clone(&line_up);
+                    scope.spawn(move || {
+                        line_up.wait();
+                        usize::from(matches!(pacing.reserve(), Reservation::Request))
+                    })
+                };
+                let finishes = {
+                    let pacing = Arc::clone(&pacing);
+                    let line_up = Arc::clone(&line_up);
+                    scope.spawn(move || {
+                        line_up.wait();
+                        (0..2 * batch).filter(|_| pacing.finish_admitted()).count()
+                    })
+                };
+                debounce.join().expect("debounce") + finishes.join().expect("finishes")
+            });
+
+            assert_eq!(
+                bookings, 1,
+                "exactly one caller may book the request after the lane drains"
+            );
+            let state = pacing.state();
+            assert!(!state.deferred, "the release always clears the park");
+            assert_eq!(
+                state.unbooked,
+                total - 3 * batch,
+                "exactly one request more was asked for"
+            );
+            assert_eq!(
+                state.outstanding, batch,
+                "its stanzas are owed, and the two arrived batches are settled"
+            );
+        }
+    }
+
+    /// S4: a window of silence while we hold the drain open is our own
+    /// backpressure, not the server giving up. Once nothing is in a lane the
+    /// resume may complete, but silence never forgives what the server still
+    /// owes: the parked request stays parked and nothing more is booked.
+    #[tokio::test]
+    async fn silence_we_cause_is_not_reported_as_a_stalled_drain() {
+        let client = armed_client(7, 1_000).await;
+        let coord = &client.offline_batch;
+        let node = offline_message_node();
+        let guard = coord.admit(&client, 7, &node).expect("armed");
+
+        assert!(
+            matches!(coord.settle_silent_drain(7), SilentDrain::Backpressure),
+            "a lane we are still feeding is not a stalled drain"
+        );
+
+        let pacing = coord.current_pacing(7).expect("armed");
+        drop(guard);
+        assert!(matches!(pacing.reserve(), Reservation::Request));
+        assert!(matches!(pacing.reserve(), Reservation::Deferred));
+        let owed = coord.outstanding();
+        assert!(
+            matches!(coord.settle_silent_drain(7), SilentDrain::Idle),
+            "nothing is in a lane, so the watchdog may complete"
+        );
+        assert_eq!(
+            coord.outstanding(),
+            owed,
+            "silence must not settle what the server still owes"
+        );
+        assert!(
+            coord.deferred(),
+            "and must not book the parked request on top of it"
+        );
+    }
+
+    /// S4: a parked request is released by the lane draining below one batch,
+    /// through the guard path production uses, not by anything the reader does.
+    #[tokio::test]
+    async fn the_lane_draining_below_one_batch_releases_the_parked_request() {
+        let client = armed_client(7, 1_000).await;
+        let coord = &client.offline_batch;
+        let batch = BATCH_SIZE as usize;
+        let node = offline_message_node();
+        let guards: Vec<_> = (0..2 * batch)
+            .map(|_| coord.admit(&client, 7, &node).expect("armed"))
+            .collect();
+        let pacing = coord.current_pacing(7).expect("armed");
+        assert!(matches!(pacing.reserve(), Reservation::Request));
+        assert!(matches!(pacing.reserve(), Reservation::Deferred));
+        assert!(coord.deferred());
+
+        drop(guards);
+        assert!(
+            !coord.deferred(),
+            "the drops that brought the lane back under one batch released it"
+        );
+        assert_eq!(
+            coord.outstanding(),
+            batch,
+            "and the released request is what is now owed"
         );
     }
 }

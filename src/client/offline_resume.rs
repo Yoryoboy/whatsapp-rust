@@ -471,22 +471,23 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
                     seen = current;
                     continue;
                 }
+                // Silence alone does not mean the server gave up: the drain may
+                // be waiting on a lane we are still feeding, or on a request we
+                // parked ourselves. Completing that would end a resume that is
+                // only being paced, and the deferred request would never leave.
+                // Decided before the claim, so a drain that stays open is never
+                // left parked on the inactive sentinel.
+                if matches!(
+                    client.offline_batch.settle_silent_drain(generation),
+                    SilentDrain::Backpressure
+                ) {
+                    continue;
+                }
                 if !client.offline_batch.try_claim_inactive(seen) {
                     // A stanza arrived while this was deciding; the drain is
                     // alive after all, so give it another window.
                     seen = client.offline_batch.stanza_activity();
                     continue;
-                }
-                // Silence alone does not mean the server gave up: the drain may
-                // be waiting on a lane we are still feeding, or on a request we
-                // parked ourselves. Completing that would end a resume that is
-                // only being paced, and the deferred request would never leave.
-                match client.offline_batch.settle_silent_drain(generation) {
-                    SilentDrain::Backpressure => {
-                        seen = client.offline_batch.stanza_activity();
-                        continue;
-                    }
-                    SilentDrain::Idle => {}
                 }
                 let processed = client
                     .offline_sync_metrics

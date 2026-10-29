@@ -9429,6 +9429,11 @@ async fn backpressure_outliving_the_watchdog_resumes_after_processing() {
         !client.offline_sync_completed.load(Ordering::Acquire),
         "a drain we are holding back is not a drain the server stopped feeding"
     );
+    assert_ne!(
+        client.offline_batch.stanza_activity(),
+        u64::MAX,
+        "a drain held open by backpressure is not left claimed as inactive"
+    );
 
     // Processing catches up: the deferred request leaves, and the resume is
     // still the one that was parked.
